@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 # Import the LigandMPNN modules
-from .data_utils import (
+from ligandmpnn.data_utils import (
     featurize,
     parse_PDB,
     restype_str_to_int,
@@ -15,7 +15,7 @@ from .data_utils import (
     get_score,
     get_seq_rec
 )
-from .model_utils import ProteinMPNN
+from ligandmpnn.model_utils import ProteinMPNN
 
 
 @dataclass
