@@ -2,12 +2,15 @@ import numpy as np
 import torch
 import tempfile
 import os
-from typing import List, Dict, Optional, Tuple, Union
+from typing import List, Dict, Optional, Sequence, Callable
+from protdesign.entity import System, SystemInstance, EntityInstance
+from protdesign.entity import EntityPosList
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Self, Tuple, Sequence, List
 
 # Import the LigandMPNN modules
-from ligandmpnn.data_utils import (
+from .data_utils import (
     featurize,
     parse_PDB,
     restype_str_to_int,
@@ -15,80 +18,25 @@ from ligandmpnn.data_utils import (
     get_score,
     get_seq_rec
 )
-from ligandmpnn.model_utils import ProteinMPNN
+from .model_utils import ProteinMPNN
 
 
-@dataclass
-class GenerationConfig:
-    """Configuration for sequence generation"""
-    temperature: float = 0.1
-    batch_size: int = 1
-    number_of_batches: int = 1
-    seed: Optional[int] = None
-    # List of position IDs like "A10", "B25"
-    fix_positions: Optional[List[str]] = None
-    # Mutually exclusive with fix_positions
-    redesign_positions: Optional[List[str]] = None
-    # Global AA bias like {"A": 1.0, "P": -2.0}
-    amino_acid_bias: Optional[Dict[str, float]] = None
-    # Per-position bias
-    bias_per_position: Optional[Dict[str, Dict[str, float]]] = None
-    omit_amino_acids: Optional[str] = None  # String of AAs to omit globally
-    omit_per_position: Optional[Dict[str, str]
-                                ] = None  # Per-position AA omission
-    use_ligand_context: bool = True
-    ligand_cutoff: float = 8.0
-
-
-class EntityInstance:
-    """Represents a specific sequence instance of an entity"""
-
-    def __init__(self, entity_id: str, sequence: str, native_sequence: str = None, recovery: float = None):
-        self.entity_id = entity_id
-        self.sequence = sequence
-        self.native_sequence = native_sequence
-        self.recovery = recovery
-
-    def __repr__(self):
-        return f"EntityInstance(entity_id='{self.entity_id}', sequence='{self.sequence[:20]}...', recovery={self.recovery:.3f})"
-
-
-class SystemInstance:
-    """Represents a complete system design with all entity instances"""
-
-    def __init__(self, entity_instances: List[EntityInstance], design_id: int = None,
-                 overall_recovery: float = None, log_probability: float = None,
-                 sampling_probabilities: np.ndarray = None):
-        self.entity_instances = entity_instances
-        self.design_id = design_id
-        self.overall_recovery = overall_recovery
-        self.log_probability = log_probability
-        self.sampling_probabilities = sampling_probabilities
-
-    def __repr__(self):
-        return f"SystemInstance(design_id={self.design_id}, entities={len(self.entity_instances)}, recovery={self.overall_recovery:.3f})"
-
-    def get_entity(self, entity_id: str) -> Optional[EntityInstance]:
-        """Get entity instance by ID"""
-        for entity in self.entity_instances:
-            if entity.entity_id == entity_id:
-                return entity
-        return None
-
-    def get_concatenated_sequence(self) -> str:
-        """Get the full concatenated sequence"""
-        return "".join([entity.sequence for entity in self.entity_instances])
-
-    def get_sequences_dict(self) -> Dict[str, str]:
-        """Get sequences as a dictionary mapping entity_id -> sequence"""
-        return {entity.entity_id: entity.sequence for entity in self.entity_instances}
+def ensure_sequence(value):
+    """Convert single values to sequences"""
+    if isinstance(value, (list, tuple)):
+        return value
+    return [value]
 
 
 class LigandMPNNWrapper:
     """
-    Wrapper for LigandMPNN that works with System objects from the notebook.
+    Wrapper for LigandMPNN that works with System objects.
 
-    Handles conversion between the System representation and LigandMPNN's expected input format.
+    Usage:
+        wrapper = LigandMPNNWrapper()
+        wrapper.build(system)
+        instances = wrapper.generate(num_designs=10, temperature=0.2)
+        scores = wrapper.score(instances)
     """
 
     def __init__(self,
@@ -119,6 +67,18 @@ class LigandMPNNWrapper:
 
         self.checkpoint_path = checkpoint_path
         self.model = None
+
+        # State that gets set during build()
+        self.system = None
+        self.feature_dict = None
+        self.entity_lengths = None
+        self.chain_mapping = None
+        self.symmetry_residues = None
+        self.symmetry_weights = None
+        self.native_seq = None
+        self.pdb_path = None
+        self._is_built = False
+
         self._load_model()
 
     def _load_model(self):
@@ -155,70 +115,119 @@ class LigandMPNNWrapper:
         self.model.to(self.device)
         self.model.eval()
 
-    def _system_to_pdb_file(self, system) -> str:
+    def ready_or_raise(self):
+        """Check if the model is ready (built) or raise an error"""
+        if not self._is_built:
+            raise RuntimeError(
+                "Model not built. Call build(system) before generate() or score()"
+            )
+
+    def build(self,
+              system: System,
+              ligand_cutoff: float = 8.0,
+              use_ligand_context: bool = True) -> 'LigandMPNNWrapper':
         """
-        Convert a System object to a temporary PDB file.
+        Build/prepare the system for sequence generation.
 
         Args:
-            system: System object with protein entities and structures
+            system: System object containing protein entities and structures
+            ligand_cutoff: Distance cutoff for ligand context
+            use_ligand_context: Whether to use ligand context
 
         Returns:
-            Path to temporary PDB file
+            self for method chaining
         """
-        # Create temporary PDB file
+        self.system = system
+
+        # Get entity sequence lengths
+        self.entity_lengths = [(idx, len(entity.rep) if entity.rep is not None else 0)
+                               for idx, entity in enumerate(system)]
+
+        # Convert system to PDB file
+        self.pdb_path = self._system_to_pdb_file(system)
+
+        # Parse PDB with LigandMPNN
+        protein_dict, backbone, other_atoms, icodes, _ = parse_PDB(
+            self.pdb_path,
+            device=self.device,
+            chains=[],
+            parse_all_atoms=True,
+            parse_atoms_with_zero_occupancy=False,
+        )
+
+        # Create mappings
+        self.chain_mapping = self._create_chain_mapping(system)
+
+        # Determine homo-oligomer symmetry if applicable
+        self.symmetry_residues, self.symmetry_weights = self._determine_homooligomer_symmetry(
+            system)
+
+        # Set up chain mask (which residues to design)
+        chain_mask = torch.ones_like(protein_dict["mask"], dtype=torch.float32)
+        protein_dict["chain_mask"] = chain_mask
+
+        # Featurize the protein
+        self.feature_dict = featurize(
+            protein_dict,
+            cutoff_for_score=ligand_cutoff,
+            use_atom_context=use_ligand_context,
+            number_of_ligand_atoms=getattr(self.model, 'atom_context_num', 25),
+            model_type=self.model_type,
+        )
+
+        # Store native sequence
+        self.native_seq = "".join([
+            restype_int_to_str[aa] for aa in self.feature_dict["S"][0].cpu().numpy()
+        ])
+
+        self._is_built = True
+        return self
+
+    def _system_to_pdb_file(self, system: System) -> str:
+        """Convert a System object to a temporary PDB file."""
         temp_fd, temp_path = tempfile.mkstemp(suffix='.pdb')
         os.close(temp_fd)
 
-        # For now, assume we're working with the first structure in the system
-        # This could be extended to handle multi-state design
         structure_keys = set()
         for entity in system:
-            structure_keys.update(entity.structures.keys())
+            structure_keys.update(entity.structures.keys()
+                                  ) if entity.structures else None
 
         if len(structure_keys) > 1:
             raise NotImplementedError(
                 "Multi-state design not currently supported")
 
-        structure_key = list(structure_keys)[0]
+        structure_key = list(structure_keys)[0] if structure_keys else None
 
         # Collect all chains from all entities for this structure
         all_chains = []
         for entity in system:
-            if structure_key in entity.structures:
-                all_chains.extend(entity.structures[structure_key])
-                entity_id = getattr(entity, 'id', f'entity_{len(all_chains)}')
+            if entity.structures and structure_key in entity.structures:
+                entity_chains = entity.structures[structure_key]
+                if not isinstance(entity_chains, list):
+                    entity_chains = [entity_chains]
+                all_chains.extend(entity_chains)
+                entity_id = entity.id_ or f'entity_{len(all_chains)}'
                 print(
-                    f"Adding chains from entity {entity_id}: {len(entity.structures[structure_key])} chains")
+                    f"Adding chains from entity {entity_id}: {len(entity_chains)} chains")
 
         print(f"Total chains to write: {len(all_chains)}")
 
         # Write combined structure to PDB file
         if all_chains:
-            # Check if we can write all chains together
             if hasattr(all_chains[0], 'to_file') and len(all_chains) == 1:
-                # Single chain case
                 all_chains[0].to_file(temp_path, format="pdb")
             elif hasattr(all_chains[0], 'to_file'):
-                # Multiple chains - need to combine them
-                # Option 1: Try to create a combined structure
                 try:
-                    # If your Structure class supports combining chains
-                    # Start with first chain
                     combined_structure = all_chains[0]
                     for chain in all_chains[1:]:
-                        # This depends on your Structure class implementation
-                        # You might need to use a different method to combine chains
                         if hasattr(combined_structure, 'add_chain'):
                             combined_structure.add_chain(chain)
                         else:
-                            # Fallback: write each chain separately and combine files
                             raise NotImplementedError(
                                 "Need to implement chain combination")
-
                     combined_structure.to_file(temp_path, format="pdb")
-
                 except (AttributeError, NotImplementedError):
-                    # Option 2: Write each chain to separate temp files and combine
                     temp_files = []
                     for i, chain in enumerate(all_chains):
                         temp_fd, temp_chain_path = tempfile.mkstemp(
@@ -227,22 +236,17 @@ class LigandMPNNWrapper:
                         chain.to_file(temp_chain_path, format="pdb")
                         temp_files.append(temp_chain_path)
 
-                    # Combine all temp files into final PDB
                     with open(temp_path, 'w') as outfile:
                         for temp_file in temp_files:
                             with open(temp_file, 'r') as infile:
-                                # Skip header lines and only keep ATOM/HETATM records
                                 for line in infile:
                                     if line.startswith(('ATOM', 'HETATM', 'TER', 'END')):
                                         outfile.write(line)
 
-                    # Clean up temp files
                     for temp_file in temp_files:
                         if os.path.exists(temp_file):
                             os.unlink(temp_file)
-
             else:
-                # Fallback to string-based approach
                 with open(temp_path, 'w') as f:
                     for chain in all_chains:
                         if hasattr(chain, 'to_pdb_string'):
@@ -250,470 +254,341 @@ class LigandMPNNWrapper:
                         else:
                             raise NotImplementedError(
                                 "Cannot write PDB - Structure class missing to_file or to_pdb_string method")
+
         print(temp_path)
         return temp_path
 
-    def _get_entity_sequence_lengths(self, system) -> List[Tuple[str, int]]:
-        """
-        Get the sequence length for each entity in order.
-
-        Args:
-            system: System object
-
-        Returns:
-            List of (entity_id, sequence_length) tuples in order
-        """
-        entity_lengths = []
-
-        for idx, entity in enumerate(system):
-            entity_id = getattr(entity, 'id', f'entity_{idx}')
-            seq_length = len(entity.rep)
-            entity_lengths.append((entity_id, seq_length))
-            print(f"Entity {entity_id}: {seq_length} residues")
-
-        return entity_lengths
-
-    def _split_concatenated_sequences(self, concatenated_sequences: List[str], entity_lengths: List[Tuple[str, int]]) -> Dict[str, List[str]]:
-        """
-        Split concatenated sequences back into per-entity sequences.
-
-        Args:
-            concatenated_sequences: List of full-length sequences
-            entity_lengths: List of (entity_id, length) tuples
-
-        Returns:
-            Dictionary mapping entity_id to list of sequences for that entity
-        """
-        separated_sequences = {entity_id: []
-                               for entity_id, _ in entity_lengths}
+    def _split_concatenated_sequences(self, concatenated_sequences: List[str],
+                                      entity_lengths: List[Tuple[int, int]]) -> Dict[int, List[str]]:
+        """Split concatenated sequences back into per-entity sequences."""
+        separated_sequences = {entity_idx: []
+                               for entity_idx, _ in entity_lengths}
 
         for concat_seq in concatenated_sequences:
             start_pos = 0
-            for entity_id, length in entity_lengths:
+            for entity_idx, length in entity_lengths:
                 entity_seq = concat_seq[start_pos:start_pos + length]
-                separated_sequences[entity_id].append(entity_seq)
+                separated_sequences[entity_idx].append(entity_seq)
                 start_pos += length
 
         return separated_sequences
 
-    def _create_chain_mapping(self, system) -> Dict[str, str]:
-        """
-        Create mapping from PDB chain IDs to entity names/indices.
-
-        Args:
-            system: System object
-
-        Returns:
-            Dictionary mapping chain_id -> entity_identifier
-        """
+    def _create_chain_mapping(self, system: System) -> Dict[str, str]:
+        """Create mapping from PDB chain IDs to entity names/indices."""
         chain_to_entity = {}
 
         for idx, entity in enumerate(system):
-            # Use index as entity identifier if no id attribute
-            entity_id = getattr(entity, 'id', f'entity_{idx}')
+            entity_id = entity.id_ or f'entity_{idx}'
 
-            for structure_key, chains in entity.structures.items():
-                for chain in chains:
-                    # Extract chain ID from chain object
-                    if hasattr(chain, 'chain_id'):
-                        chain_id = chain.chain_id
-                    elif hasattr(chain, 'get_id'):
-                        chain_id = chain.get_id()
-                    else:
-                        # Try to get chain ID from the chain object's attributes
-                        # This might vary depending on your Structure implementation
-                        chain_id = getattr(chain, 'id', f'chain_{idx}')
+            if entity.structures:
+                for structure_key, chains in entity.structures.items():
+                    if not isinstance(chains, list):
+                        chains = [chains]
+                    for chain in chains:
+                        if hasattr(chain, 'chain_id'):
+                            chain_id = chain.chain_id
+                        elif hasattr(chain, 'get_id'):
+                            chain_id = chain.get_id()
+                        else:
+                            chain_id = getattr(chain, 'id', f'chain_{idx}')
 
-                    chain_to_entity[chain_id] = entity_id
-                    print(f"Mapped chain {chain_id} to entity {entity_id}")
+                        chain_to_entity[chain_id] = entity_id
+                        print(f"Mapped chain {chain_id} to entity {entity_id}")
 
         return chain_to_entity
 
-    def _determine_homooligomer_symmetry(self, system) -> Tuple[List[List[int]], List[List[float]]]:
-        """
-        Determine symmetry constraints for homo-oligomers.
-
-        Args:
-            system: System object
-
-        Returns:
-            Tuple of (symmetry_residues, symmetry_weights)
-        """
+    def _determine_homooligomer_symmetry(self, system: System) -> Tuple[List[List[int]], List[List[float]]]:
+        """Determine symmetry constraints for homo-oligomers."""
         symmetry_residues = []
         symmetry_weights = []
 
         for entity in system:
-            for structure_key, chains in entity.structures.items():
-                if len(chains) > 1:  # Homo-oligomer
-                    # Create symmetry groups for each position
-                    seq_length = len(entity.rep)
-                    for pos in range(seq_length):
-                        residue_group = []
-                        weight_group = []
+            if entity.structures:
+                for structure_key, chains in entity.structures.items():
+                    if not isinstance(chains, list):
+                        chains = [chains]
 
-                        for i, chain in enumerate(chains):
-                            # Create position identifier
-                            residue_group.append(pos + i * seq_length)
-                            weight_group.append(1.0 / len(chains))
+                    if len(chains) > 1:  # Homo-oligomer
+                        seq_length = len(
+                            entity.rep) if entity.rep is not None else 0
+                        for pos in range(seq_length):
+                            residue_group = []
+                            weight_group = []
 
-                        symmetry_residues.append(residue_group)
-                        symmetry_weights.append(weight_group)
+                            for i, _ in enumerate(chains):
+                                residue_group.append(pos + i * seq_length)
+                                weight_group.append(1.0 / len(chains))
+
+                            symmetry_residues.append(residue_group)
+                            symmetry_weights.append(weight_group)
 
         return symmetry_residues, symmetry_weights
 
-    def _prepare_constraints(self, system, config: GenerationConfig, chain_mapping: Dict[str, str]) -> Dict:
+    def _create_chain_mask(self, fixed_pos: EntityPosList | None) -> torch.Tensor:
         """
-        Prepare position constraints and biases.
+        Create chain mask from fixed positions.
 
         Args:
-            system: System object
-            config: Generation configuration
-            chain_mapping: Mapping from chain IDs to entity IDs
+            fixed_pos: Mapping of entity_idx -> list of fixed positions
 
         Returns:
-            Dictionary with constraint information
+            Chain mask tensor (1 = design, 0 = fixed)
         """
-        constraints = {
-            'fixed_residues': [],
-            'redesigned_residues': [],
-            'bias_per_residue': {},
-            'omit_per_residue': {},
-        }
+        chain_mask = torch.ones_like(
+            self.feature_dict["mask"], dtype=torch.float32)
 
-        # Handle position fixing/redesigning
-        if config.fix_positions:
-            constraints['fixed_residues'] = config.fix_positions
-        elif config.redesign_positions:
-            constraints['redesigned_residues'] = config.redesign_positions
+        if fixed_pos is not None:
+            # Start position for each entity in the concatenated sequence
+            entity_starts = {}
+            current_pos = 0
+            for idx, (entity_id, length) in enumerate(self.entity_lengths):
+                entity_starts[idx] = current_pos
+                current_pos += length
 
-        # Handle per-position biases
-        if config.bias_per_position:
-            constraints['bias_per_residue'] = config.bias_per_position
+            # Set fixed positions to 0
+            for entity_idx, positions in fixed_pos.items():
+                start_pos = entity_starts[entity_idx]
+                for pos in positions:
+                    chain_mask[0, start_pos + pos] = 0.0
 
-        # Handle per-position omissions
-        if config.omit_per_position:
-            constraints['omit_per_residue'] = config.omit_per_position
+        return chain_mask
 
-        return constraints
+    def _create_bias_tensor(self, amino_acid_bias: Dict[str, float]) -> torch.Tensor:
+        """Create bias tensor from amino acid bias dictionary."""
+        bias_tensor = torch.zeros(
+            [21], device=self.device, dtype=torch.float32)
+        for aa, bias in amino_acid_bias.items():
+            if aa in restype_str_to_int:
+                bias_tensor[restype_str_to_int[aa]] = bias
+        return bias_tensor
 
-    def _create_system_instances(self, separated_sequences: Dict[str, List[str]],
-                                 native_separated: Dict[str, str],
-                                 recoveries_by_entity: Dict[str, List[float]],
-                                 overall_recoveries: List[float],
-                                 probs_stack: torch.Tensor,
-                                 log_probs_stack: torch.Tensor,
-                                 entity_lengths: List[Tuple[str, int]]) -> List[SystemInstance]:
+    def generate(
+        self,
+        num_designs: int,
+        entities: Sequence[int] | None = None,
+        fixed_pos: EntityPosList | None = None,
+        temperature: float = 0.1,
+        batch_size: int = 1,
+        seed: Optional[int] = None,
+        amino_acid_bias: Optional[Dict[str, float]] = None,
+        omit_amino_acids: Optional[str] = None,
+        use_ligand_context: bool = True,
+        status_callback: Callable[[str], None] | None = None
+    ) -> List[SystemInstance]:
         """
-        Create SystemInstance objects from the generated sequences.
+        Generate new sequences for the built structure and optionally score them.
 
         Args:
-            separated_sequences: Dictionary mapping entity_id to list of sequences
-            native_separated: Dictionary mapping entity_id to native sequence
-            recoveries_by_entity: Dictionary mapping entity_id to list of recoveries
-            overall_recoveries: List of overall sequence recoveries
-            probs_stack: Tensor of sampling probabilities
-            log_probs_stack: Tensor of log probabilities
-            entity_lengths: List of (entity_id, length) tuples
+            num_designs: Number of designs to generate
+            entities: Which entities to design (None = all)
+            fixed_pos: Mapping of entity_idx -> list of fixed positions
+            temperature: Sampling temperature
+            batch_size: Batch size for generation
+            seed: Random seed
+            amino_acid_bias: Global amino acid biases
+            omit_amino_acids: Amino acids to omit globally
+            use_ligand_context: Whether to use ligand context
+            status_callback: Optional callback for status updates
 
         Returns:
-            List of SystemInstance objects
+            List of SystemInstance objects with optional scores
         """
+        # 1. Check model is ready
+        self.ready_or_raise()
+
+        # 2. Set random seed
+        if seed is not None:
+            torch.manual_seed(seed)
+            np.random.seed(seed)
+
+        # 3. Validate entity selection
+        if entities is not None:
+            entities = ensure_sequence(entities)
+            # Validate entities exist in system
+            max_entity = len(self.system) - 1
+            for entity_idx in entities:
+                if entity_idx > max_entity:
+                    raise ValueError(
+                        f"Entity index {entity_idx} out of range (max: {max_entity})")
+        else:
+            entities = list(range(len(self.system)))
+
+        # 4. Process fixed_pos into chain_mask
+        chain_mask = self._create_chain_mask(fixed_pos)
+
+        # 5. Update feature_dict with generation parameters
+        feature_dict_copy = self.feature_dict.copy()
+        feature_dict_copy["chain_mask"] = chain_mask
+        feature_dict_copy["batch_size"] = batch_size
+        feature_dict_copy["temperature"] = temperature
+        feature_dict_copy["symmetry_residues"] = self.symmetry_residues or [[]]
+        feature_dict_copy["symmetry_weights"] = self.symmetry_weights or [[]]
+
+        # 6. Apply amino acid biases (always set bias tensor)
+        B, L, _, _ = feature_dict_copy["X"].shape
+        if amino_acid_bias:
+            bias_tensor = self._create_bias_tensor(amino_acid_bias)
+        else:
+            bias_tensor = torch.zeros(
+                [21], device=self.device, dtype=torch.float32)
+        feature_dict_copy["bias"] = bias_tensor[None, None, :].repeat(1, L, 1)
+
+        # 7. Generate sequences using the model
+        L = feature_dict_copy["X"].shape[1]
+        generated_sequences = []
+
+        with torch.no_grad():
+            num_batches = (num_designs + batch_size - 1) // batch_size
+            for batch_idx in range(num_batches):
+                if status_callback:
+                    status_callback(
+                        f"Generating batch {batch_idx + 1}/{num_batches}")
+
+                feature_dict_copy["randn"] = torch.randn(
+                    [batch_size, L], device=self.device)
+                output_dict = self.model.sample(feature_dict_copy)
+                generated_sequences.append(output_dict["S"])
+
+        S_stack = torch.cat(generated_sequences, 0)[:num_designs]
+
+        # 8. Convert to sequences and split by entity
+        concatenated_sequences = [
+            "".join([restype_int_to_str[aa]
+                    for aa in S_stack[i].cpu().numpy()])
+            for i in range(S_stack.shape[0])
+        ]
+
+        separated_sequences = self._split_concatenated_sequences(
+            concatenated_sequences, self.entity_lengths
+        )
+
+        # 9. Create SystemInstance objects
         system_instances = []
-
-        # Determine number of designs
-        first_entity_id = list(separated_sequences.keys())[0]
-        num_designs = len(separated_sequences[first_entity_id])
-
         for design_idx in range(num_designs):
             entity_instances = []
 
-            # Create EntityInstance for each entity in this design
-            for entity_id, _ in entity_lengths:
-                entity_sequence = separated_sequences[entity_id][design_idx]
-                native_sequence = native_separated[entity_id]
-                recovery = recoveries_by_entity[entity_id][design_idx]
+            # Calculate individual entity recoveries
+            for entity_idx, (entity_id, length) in enumerate(self.entity_lengths):
+                generated_seq = separated_sequences[entity_idx][design_idx]
+                native_seq = self.native_seq[sum(length for (_, length) in self.entity_lengths[:entity_idx]):sum(
+                    length for (_, length) in self.entity_lengths[:entity_idx+1])]
 
+                # Calculate recovery
+                matches = sum(1 for a, b in zip(
+                    native_seq, generated_seq) if a == b)
+                recovery = matches / len(native_seq)
+
+                # Create EntityInstance
+                # Ensure rep is a string, not a numpy array
                 entity_instance = EntityInstance(
-                    entity_id=entity_id,
-                    sequence=entity_sequence,
-                    native_sequence=native_sequence,
-                    recovery=recovery
+                    rep=''.join(generated_seq) if hasattr(
+                        generated_seq, 'tolist') else generated_seq,
+                    models=self.system[entity_idx].structures
                 )
+
                 entity_instances.append(entity_instance)
+
+            # Calculate overall recovery
+            overall_matches = sum(1 for a, b in zip(self.native_seq, "".join(
+                str(inst.rep) for inst in entity_instances)) if a == b)
+            overall_recovery = overall_matches / len(self.native_seq)
 
             # Create SystemInstance
             system_instance = SystemInstance(
                 entity_instances=entity_instances,
-                design_id=design_idx,
-                overall_recovery=overall_recoveries[design_idx],
-                log_probability=log_probs_stack[design_idx].sum().item(),
-                sampling_probabilities=probs_stack[design_idx].cpu().numpy()
+                score=None,
+                confidence=None,
+                metadata={
+                    'design_id': design_idx,
+                    'overall_recovery': overall_recovery,
+                    'log_probability': None,
+                    'sampling_probabilities': None
+                }
             )
 
             system_instances.append(system_instance)
 
+        # 10. Score the generated instances
+        scores = self.score(system_instances, status_callback=status_callback)
+
+        # 11. Attach scores to instances
+        for instance, raw_score in zip(system_instances, scores):
+            instance.score = raw_score
+            instance.metadata['log_probability'] = raw_score
+
         return system_instances
 
-    def generate(self, system, config: GenerationConfig = None) -> List[SystemInstance]:
+    def score(
+        self,
+        instances: Sequence[SystemInstance],
+        status_callback: Callable[[str], None] | None = None
+    ) -> np.ndarray:
         """
-        Generate protein sequences for the given system.
+        Score sequences against the built structure.
 
         Args:
-            system: System object containing protein entities and structures
-            config: Generation configuration
+            instances: Sequence of SystemInstance objects to score
+            status_callback: Optional callback for status updates
 
         Returns:
-            List of SystemInstance objects, each containing EntityInstance objects for all entities
+            Numpy array of scores (log probabilities)
         """
-        if config is None:
-            config = GenerationConfig()
+        # 1. Check model is ready
+        self.ready_or_raise()
 
-        # Set random seed if provided
-        if config.seed is not None:
-            torch.manual_seed(config.seed)
-            np.random.seed(config.seed)
+        # 2. Extract sequences from instances
+        sequences = []
+        for instance in instances:
+            # Ensure each instance's rep is converted to a string
+            concat_seq = "".join([
+                ''.join(inst.rep) if hasattr(
+                    inst.rep, 'tolist') else str(inst.rep)
+                for inst in instance
+            ])
+            sequences.append(concat_seq)
 
-        # Get entity sequence lengths for splitting later
-        entity_lengths = self._get_entity_sequence_lengths(system)
+        # 3. Score each sequence
+        scores = []
+        with torch.no_grad():
+            for seq_idx, seq in enumerate(sequences):
+                if status_callback:
+                    status_callback(
+                        f"Scoring sequence {seq_idx + 1}/{len(sequences)}")
 
-        # Convert system to PDB file
-        pdb_path = self._system_to_pdb_file(system)
+                # Convert sequence to tensor
+                S_tensor = torch.tensor(
+                    [restype_str_to_int.get(aa, 20) for aa in seq],
+                    device=self.device,
+                    dtype=torch.int64
+                )[None, :]
 
-        try:
-            # Parse PDB with LigandMPNN
-            protein_dict, backbone, other_atoms, icodes, _ = parse_PDB(
-                pdb_path,
-                device=self.device,
-                chains=[],  # Parse all chains
-                parse_all_atoms=True,
-                parse_atoms_with_zero_occupancy=False,
-            )
+                # Create feature dict for this sequence
+                feature_dict_copy = self.feature_dict.copy()
+                feature_dict_copy["S"] = S_tensor
+                feature_dict_copy["batch_size"] = 1
+                feature_dict_copy["randn"] = torch.randn(
+                    [1, len(seq)], device=self.device)
+                feature_dict_copy["symmetry_residues"] = [[]]
+                feature_dict_copy["symmetry_weights"] = [[]]
 
-            # Create mappings
-            chain_mapping = self._create_chain_mapping(system)
+                # Score the sequence
+                output_dict = self.model.score(
+                    feature_dict_copy, use_sequence=True)
 
-            # Determine homo-oligomer symmetry if applicable
-            symmetry_residues, symmetry_weights = self._determine_homooligomer_symmetry(
-                system)
-
-            # Prepare constraints
-            constraints = self._prepare_constraints(
-                system, config, chain_mapping)
-
-            # Set up chain mask (which residues to design)
-            chain_mask = torch.ones_like(
-                protein_dict["mask"], dtype=torch.float32)
-
-            # Apply position constraints
-            if constraints['fixed_residues'] or constraints['redesigned_residues']:
-                # This would need to be implemented based on the residue naming scheme
-                # For now, assume all positions are designable
-                pass
-
-            protein_dict["chain_mask"] = chain_mask
-
-            # Featurize the protein
-            feature_dict = featurize(
-                protein_dict,
-                cutoff_for_score=config.ligand_cutoff,
-                use_atom_context=config.use_ligand_context,
-                number_of_ligand_atoms=getattr(
-                    self.model, 'atom_context_num', 25),
-                model_type=self.model_type,
-            )
-
-            # Set up generation parameters
-            feature_dict["batch_size"] = config.batch_size
-            feature_dict["temperature"] = config.temperature
-            feature_dict["symmetry_residues"] = symmetry_residues or [[]]
-            feature_dict["symmetry_weights"] = symmetry_weights or [[]]
-
-            # Set up amino acid biases
-            bias_tensor = torch.zeros(
-                [21], device=self.device, dtype=torch.float32)
-            if config.amino_acid_bias:
-                for aa, bias in config.amino_acid_bias.items():
-                    if aa in restype_str_to_int:
-                        bias_tensor[restype_str_to_int[aa]] = bias
-
-            B, L, _, _ = feature_dict["X"].shape
-            feature_dict["bias"] = bias_tensor[None, None, :].repeat(1, L, 1)
-
-            # Generate sequences
-            generated_sequences = []
-            sampling_probs = []
-            log_probs = []
-
-            with torch.no_grad():
-                for batch_idx in range(config.number_of_batches):
-                    # Add random noise for decoding order
-                    feature_dict["randn"] = torch.randn(
-                        [config.batch_size, L], device=self.device
-                    )
-
-                    # Sample sequences
-                    output_dict = self.model.sample(feature_dict)
-
-                    generated_sequences.append(output_dict["S"])
-                    sampling_probs.append(output_dict["sampling_probs"])
-                    log_probs.append(output_dict["log_probs"])
-
-            # Combine results
-            S_stack = torch.cat(generated_sequences, 0)
-            probs_stack = torch.cat(sampling_probs, 0)
-            log_probs_stack = torch.cat(log_probs, 0)
-
-            # Convert to concatenated sequences
-            concatenated_sequences = []
-            for i in range(S_stack.shape[0]):
-                seq = "".join([restype_int_to_str[aa]
-                              for aa in S_stack[i].cpu().numpy()])
-                concatenated_sequences.append(seq)
-
-            # Split sequences by entity
-            separated_sequences = self._split_concatenated_sequences(
-                concatenated_sequences, entity_lengths)
-
-            # Calculate sequence recovery for concatenated sequence
-            native_seq = "".join([restype_int_to_str[aa]
-                                 for aa in feature_dict["S"][0].cpu().numpy()])
-
-            # Split native sequence by entity too
-            native_separated = self._split_concatenated_sequences(
-                [native_seq], entity_lengths)
-            native_by_entity = {
-                entity_id: seqs[0] for entity_id, seqs in native_separated.items()}
-
-            # Calculate recovery per entity
-            recoveries_by_entity = {}
-            for entity_id in separated_sequences:
-                entity_recoveries = []
-                native_entity_seq = native_by_entity[entity_id]
-
-                for generated_entity_seq in separated_sequences[entity_id]:
-                    # Calculate simple sequence identity
-                    matches = sum(1 for a, b in zip(
-                        native_entity_seq, generated_entity_seq) if a == b)
-                    recovery = matches / len(native_entity_seq)
-                    entity_recoveries.append(recovery)
-
-                recoveries_by_entity[entity_id] = entity_recoveries
-
-            # Overall recoveries for concatenated sequences
-            overall_recoveries = []
-            for i in range(S_stack.shape[0]):
-                recovery = get_seq_rec(
-                    feature_dict["S"][:1],
-                    S_stack[i:i+1],
-                    feature_dict["mask"][:1] * feature_dict["chain_mask"][:1]
+                # Calculate loss (negative log probability)
+                loss, _ = get_score(
+                    output_dict["S"],
+                    output_dict["log_probs"],
+                    self.feature_dict["mask"][:1]
                 )
-                overall_recoveries.append(recovery.item())
 
-            # Create SystemInstance objects
-            system_instances = self._create_system_instances(
-                separated_sequences=separated_sequences,
-                native_separated=native_by_entity,
-                recoveries_by_entity=recoveries_by_entity,
-                overall_recoveries=overall_recoveries,
-                probs_stack=probs_stack,
-                log_probs_stack=log_probs_stack,
-                entity_lengths=entity_lengths
-            )
+                # Convert to positive log likelihood
+                scores.append(-loss.item())
 
-            return system_instances
+        # 4. Return as numpy array
+        return np.array(scores)
 
-        finally:
-            # Clean up temporary file
-            if os.path.exists(pdb_path):
-                os.unlink(pdb_path)
-
-    def score_sequences(self, system, sequences: List[str], config: GenerationConfig = None) -> Dict:
-        """
-        Score given sequences against the system structure.
-
-        Args:
-            system: System object containing protein entities and structures
-            sequences: List of sequences to score
-            config: Generation configuration
-
-        Returns:
-            Dictionary containing scores and probabilities
-        """
-        if config is None:
-            config = GenerationConfig()
-
-        # Convert system to PDB file
-        pdb_path = self._system_to_pdb_file(system)
-
-        try:
-            # Parse PDB
-            protein_dict, _, _, _, _ = parse_PDB(
-                pdb_path,
-                device=self.device,
-                chains=[],
-                parse_all_atoms=True,
-                parse_atoms_with_zero_occupancy=False,
-            )
-
-            # Add chain mask before featurizing
-            chain_mask = torch.ones_like(
-                protein_dict["mask"], dtype=torch.float32)
-            protein_dict["chain_mask"] = chain_mask
-
-            # Featurize
-            feature_dict = featurize(
-                protein_dict,
-                cutoff_for_score=config.ligand_cutoff,
-                use_atom_context=config.use_ligand_context,
-                number_of_ligand_atoms=getattr(
-                    self.model, 'atom_context_num', 25),
-                model_type=self.model_type,
-            )
-
-            scores = []
-            log_probs_list = []
-
-            with torch.no_data():
-                for seq in sequences:
-                    # Convert sequence to tensor
-                    S_tensor = torch.tensor(
-                        [restype_str_to_int.get(aa, 20) for aa in seq],
-                        device=self.device,
-                        dtype=torch.int64
-                    )[None, :]  # Add batch dimension
-
-                    # Update feature dict with sequence
-                    feature_dict_copy = feature_dict.copy()
-                    feature_dict_copy["S"] = S_tensor
-                    feature_dict_copy["batch_size"] = 1
-                    feature_dict_copy["randn"] = torch.randn(
-                        [1, len(seq)], device=self.device)
-                    feature_dict_copy["symmetry_residues"] = [[]]
-
-                    # Score the sequence
-                    output_dict = self.model.score(
-                        feature_dict_copy, use_sequence=True)
-
-                    # Calculate loss (negative log probability)
-                    loss, _ = get_score(
-                        output_dict["S"],
-                        output_dict["log_probs"],
-                        feature_dict["mask"][:1]
-                    )
-
-                    # Convert to positive log likelihood
-                    scores.append(-loss.item())
-                    log_probs_list.append(
-                        output_dict["log_probs"].cpu().numpy())
-
-            return {
-                "sequences": sequences,
-                "scores": scores,
-                "log_probabilities": log_probs_list,
-                "system": system,
-            }
-
-        finally:
-            # Clean up temporary file
-            if os.path.exists(pdb_path):
-                os.unlink(pdb_path)
+    def __del__(self):
+        """Cleanup temporary files"""
+        if hasattr(self, 'pdb_path') and self.pdb_path and os.path.exists(self.pdb_path):
+            os.unlink(self.pdb_path)
