@@ -2,15 +2,14 @@ import numpy as np
 import torch
 import tempfile
 import os
-from typing import List, Dict, Optional, Sequence, Callable
+from typing import List, Dict, Sequence, Callable
 from protdesign.entity import System, SystemInstance, EntityInstance
 from protdesign.entity import EntityPosList
-from dataclasses import dataclass
 from pathlib import Path
-from typing import Self, Tuple, Sequence, List
+from typing import Self, Tuple, Sequence, List, Optional
 
 # Import the LigandMPNN modules
-from .data_utils import (
+from ligandmpnn.data_utils import (
     featurize,
     parse_PDB,
     restype_str_to_int,
@@ -18,7 +17,7 @@ from .data_utils import (
     get_score,
     get_seq_rec
 )
-from .model_utils import ProteinMPNN
+from ligandmpnn.model_utils import ProteinMPNN
 
 
 def ensure_sequence(value):
@@ -41,8 +40,11 @@ class LigandMPNNWrapper:
 
     def __init__(self,
                  model_type: str = "ligand_mpnn",
-                 checkpoint_path: Optional[str] = None,
-                 device: Optional[str] = None):
+                 checkpoint_path: str | None = None,
+                 device: str | None = None,
+                 batch_size: int = 1,
+                 seed: int | None = None,
+                 use_ligand_context: bool = True):
         """
         Initialize the LigandMPNN wrapper.
 
@@ -50,10 +52,16 @@ class LigandMPNNWrapper:
             model_type: Type of model ("ligand_mpnn", "protein_mpnn", "soluble_mpnn", etc.)
             checkpoint_path: Path to model checkpoint
             device: Device to run on ("cuda" or "cpu")
+            batch_size: Batch size for sequence generation
+            seed: Random seed for sequence generation
+            use_ligand_context: Whether to use ligand context
         """
         self.model_type = model_type
         self.device = device or (
             "cuda" if torch.cuda.is_available() else "cpu")
+        self.batch_size = batch_size
+        self.seed = seed
+        self.use_ligand_context = use_ligand_context
 
         # Set default checkpoint paths
         if checkpoint_path is None:
@@ -86,6 +94,11 @@ class LigandMPNNWrapper:
         if not os.path.exists(self.checkpoint_path):
             raise FileNotFoundError(
                 f"Checkpoint not found: {self.checkpoint_path}")
+
+        # Set random seed if provided
+        if self.seed is not None:
+            torch.manual_seed(self.seed)
+            np.random.seed(self.seed)
 
         checkpoint = torch.load(self.checkpoint_path, map_location=self.device)
 
@@ -124,15 +137,13 @@ class LigandMPNNWrapper:
 
     def build(self,
               system: System,
-              ligand_cutoff: float = 8.0,
-              use_ligand_context: bool = True) -> 'LigandMPNNWrapper':
+              ligand_cutoff: float = 8.0) -> 'LigandMPNNWrapper':
         """
         Build/prepare the system for sequence generation.
 
         Args:
             system: System object containing protein entities and structures
             ligand_cutoff: Distance cutoff for ligand context
-            use_ligand_context: Whether to use ligand context
 
         Returns:
             self for method chaining
@@ -170,7 +181,7 @@ class LigandMPNNWrapper:
         self.feature_dict = featurize(
             protein_dict,
             cutoff_for_score=ligand_cutoff,
-            use_atom_context=use_ligand_context,
+            use_atom_context=self.use_ligand_context,
             number_of_ligand_atoms=getattr(self.model, 'atom_context_num', 25),
             model_type=self.model_type,
         )
@@ -482,8 +493,7 @@ class LigandMPNNWrapper:
                 # Ensure rep is a string, not a numpy array
                 entity_instance = EntityInstance(
                     rep=''.join(generated_seq) if hasattr(
-                        generated_seq, 'tolist') else generated_seq,
-                    models=self.system[entity_idx].structures
+                        generated_seq, 'tolist') else generated_seq
                 )
 
                 entity_instances.append(entity_instance)
