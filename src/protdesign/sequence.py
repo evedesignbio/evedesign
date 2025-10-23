@@ -1,11 +1,15 @@
 """
 Biopolymer sequence functionality (protein sequences etc.)
 """
-from typing import List, Literal, Self, TextIO, Tuple
+from string import ascii_lowercase
+from typing import Any, List, Literal, Self, TextIO, Tuple
 from collections import abc
-from protdesign.constants import AA_TO_INDEX, MASK, GAP, INDEX_TO_AA
-from protdesign.types import BioPolymer
+from protdesign.constants import MASK, GAP
+from protdesign.types import BioPolymer, RepSequence, SequenceMetadata
 from protdesign.utils import shorten
+
+
+REMOVE_INSERTIONS_TRANSLATION = str.maketrans("", "", ascii_lowercase)
 
 
 class Sequence:
@@ -18,9 +22,10 @@ class Sequence:
     def __init__(
         self,
         seq: str,
-        id: str | None = None,
+        id: str | None = None,  # noqa
         key: str | None = None,
-        type: BioPolymer = "protein",
+        type: BioPolymer = "protein",  # noqa
+        metadata: SequenceMetadata | None = None,
     ):
         """
         Create new sequence object
@@ -35,15 +40,90 @@ class Sequence:
             Key for matching sequence to other resources (e.g. paired alignment)
         type
             Type of biopolymer sequence (protein, rna, dna, ...)
+        metadata
+            Optional sequence metadata (embeddings, taxonomy, ...)
         """
         self.seq = seq
         self.id_ = id
         self.key = key
         self.type_ = type
+        self.metadata = metadata
 
     def __repr__(self) -> str:
         return (
             f"Sequence(id={self.id_} key={self.key} type={self.type_} seq={shorten(self.seq)})"
+        )
+
+    def serialize(self) -> dict[str, Any]:
+        """
+        Serialize sequence into JSON-compatible representation
+
+        Returns
+        -------
+        Serialized sequence representation
+        """
+        return {
+            "seq": self.seq,
+            "id": self.id_,
+            "key": self.key,
+            "type": self.type_,
+            "metadata": self.metadata,
+        }
+
+    @classmethod
+    def deserialize(cls, serialized_seq: dict[str, Any]) -> Self:
+        """
+        Deserialize JSON-compatible representation into Sequence object
+
+        Parameters
+        ----------
+        serialized_seq
+            Serialized sequence representation
+
+        Returns
+        -------
+        Deserialized Sequence object
+        """
+        return cls(
+            seq=serialized_seq.get("seq"),
+            id=serialized_seq.get("id"),
+            key=serialized_seq.get("key"),
+            type=serialized_seq.get("type"),
+            metadata=serialized_seq.get("metadata")
+        )
+
+    def remove_insertions(self) -> Self:
+        """
+        Return updated version of sequence with any insertions (lowercase letters)
+        removed
+
+        Returns
+        -------
+        Updated sequence without insertions
+        """
+        return type(self)(
+            seq=self.seq.translate(REMOVE_INSERTIONS_TRANSLATION),
+            id=self.id_,
+            key=self.key,
+            type=self.type_,
+            metadata=self.metadata.copy() if self.metadata is not None else None
+        )
+
+    def dealign(self) -> Self:
+        """
+        Remove alignment information from sequence (removing gaps,
+        converting insert positions to uppercase letters)
+
+        Returns
+        -------
+        Dealigned sequence
+        """
+        return type(self)(
+            seq=self.seq.replace(GAP, "").upper(),
+            id=self.id_,
+            key=self.key,
+            type=self.type_,
+            metadata=self.metadata.copy() if self.metadata is not None else None
         )
 
 
@@ -59,11 +139,10 @@ class Sequences:
         self,
         seqs: abc.Sequence[Sequence],
         aligned: bool = False,
-        type: BioPolymer = "protein",
+        type: BioPolymer = "protein",  # noqa
         weights: List[float] | None = None,
-        format: Literal["a3m", "a2m", "fasta"] | None = None,
+        format: Literal["a3m", "a2m", "fasta"] | None = None,  # noqa
     ):
-
         self.seqs = seqs
         self.aligned = aligned
         self.type_ = type
@@ -77,6 +156,45 @@ class Sequences:
          # TODO: callback param for header parsing
         raise NotImplementedError(
             "Loading from file not yet implemented"
+        )
+
+    def serialize(self) -> dict[str, Any]:
+        """
+        Serialize sequences into JSON-compatible representation
+
+        Returns
+        -------
+        Serialized sequences
+        """
+        return {
+            "seqs": [seq.serialize() for seq in self.seqs],
+            "aligned": self.aligned,
+            "type": self.type_,
+            "weights": self.weights,
+            "format": self.format_,
+        }
+
+    @classmethod
+    def deserialize(cls, serialized_seqs: dict[str, Any]) -> Self:
+        """
+        Deserialize JSON-compatible representation of multiple sequences
+        into Sequences object
+
+        Parameters
+        ----------
+        serialized_seqs
+            Serialized representation of sequences
+
+        Returns
+        -------
+        Deserialized Sequence object
+        """
+        return cls(
+            seqs=[Sequence.deserialize(seq) for seq in serialized_seqs["seqs"]],
+            aligned=serialized_seqs.get("aligned"),
+            type=serialized_seqs.get("type"),
+            weights=serialized_seqs.get("weights"),
+            format=serialized_seqs.get("format"),
         )
 
     def dealign(self) -> Self:
@@ -113,44 +231,81 @@ class Sequences:
                 "Conversion into fasta format not yet implemented"
             )
 
-def valid_protein_sequence(
-    seq: str,
+def valid_sequence(
+    seq: str | RepSequence,
+    alphabet: list[str],
     allow_mask: bool = False,
-    allow_gap: bool = False,
-    allow_ambiguous: bool = False,
 ) -> Tuple[bool, List[Tuple[int, str]]]:
     """
-    Check if a given sequence is a valid protein sequence
+    Check if a given sequence is valid according to some alphabet
 
     Parameters
     ----------
     seq
-        Protein seqeunce
+        Sequence to validate
+    alphabet
+        Valid symbols (may contain GAP and insert symbols)
     allow_mask
-        Consider mask character as valid symbol (default: False)
-    allow_gap
-        Consider gap character as valid symbol (default: False)
-    allow_ambiguous
-        Consider ambiguous amino acids as valid symbol (default: False)
+        If true, allow masked positions in the sequence
 
     Returns
     -------
     bool
         True if valid sequence, False otherwise
-    str
-        Invalid characters and their indices in sequence
+    list[tuple[int, str]]
+        Invalid characters and their zero-based indices in sequence
     """
+    alphabet = set(alphabet)
+
     invalid = [
-        (i, aa) for i, aa in enumerate(seq) if not (
-            aa in AA_TO_INDEX or
-            (allow_mask and aa == MASK) or
-            (allow_gap and aa == GAP)
-        ) or (
-            not allow_ambiguous and aa in AA_TO_INDEX and INDEX_TO_AA[AA_TO_INDEX[aa]] != aa
+        (i, symbol) for i, symbol in enumerate(seq) if not (
+            symbol in alphabet or
+            (allow_mask and symbol == MASK)
         )
     ]
 
     return len(invalid) == 0, invalid
+
+
+# TODO: following is legacy function superseded by valid_sequence(), remove eventually
+# def valid_protein_sequence(
+#     seq: str,
+#     allow_mask: bool = False,
+#     allow_gap: bool = False,
+#     allow_ambiguous: bool = False,
+# ) -> Tuple[bool, List[Tuple[int, str]]]:
+#     """
+#     Check if a given sequence is a valid protein sequence
+#
+#     Parameters
+#     ----------
+#     seq
+#         Protein seqeunce
+#     allow_mask
+#         Consider mask character as valid symbol (default: False)
+#     allow_gap
+#         Consider gap character as valid symbol (default: False)
+#     allow_ambiguous
+#         Consider ambiguous amino acids as valid symbol (default: False)
+#
+#     Returns
+#     -------
+#     bool
+#         True if valid sequence, False otherwise
+#     str
+#         Invalid characters and their indices in sequence
+#     """
+#     invalid = [
+#         (i, aa) for i, aa in enumerate(seq) if not (
+#             aa in AA_TO_INDEX or
+#             (allow_mask and aa == MASK) or
+#             (allow_gap and aa == GAP)
+#         ) or (
+#             not allow_ambiguous and aa in AA_TO_INDEX and INDEX_TO_AA[AA_TO_INDEX[aa]] != aa
+#         )
+#     ]
+#
+#     return len(invalid) == 0, invalid
 
 
 def read_fasta(f: TextIO):

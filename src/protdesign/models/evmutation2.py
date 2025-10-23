@@ -8,41 +8,45 @@ from contextlib import contextmanager
 import numpy as np
 import pandas as pd
 from loguru import logger
+import torch
 
-from protdesign.model import BaseModel, Scorer, Generator, RequiredResources
+from protdesign.model import (
+    BaseModel, Scorer, Generator, RequiredResources, MutationScorer, ConditionalMutationScorer
+)
 from protdesign.entity import System, SystemInstance, EntityInstance, EntityPosList, Mutant
-from protdesign.constants import MASK, VALID_AA_OR_GAP_SORTED
-from protdesign.sequence import valid_protein_sequence
+from protdesign.constants import MASK
 from protdesign.utils import ensure_sequence, model_param_context
 from protdesign.types import DeviceType, StatusCallback, BatchSize
 
 try:
-    from picasso_model import model, features, parsers
-    import torch
+    from picasso_model import model, features, parsers  # noqa
     IMPORT_AVAILABLE = True
 except ImportError:
     IMPORT_AVAILABLE = False
 
 
-class EVmutation2(BaseModel, Scorer, Generator):
+class EVmutation2(BaseModel, Scorer, MutationScorer, ConditionalMutationScorer, Generator):
     """
     Wrapper class around EVmutation2/picasso model
     """
     available = IMPORT_AVAILABLE
     name: str = "EVmutation2"
 
-    requires_heavy_build: bool = False
+    # core properties
+    requires_target: bool = True
+    requires_fixed_length: bool = True
+    handles_deletions: bool = True
+    handles_insertions: bool = False
     requires_gpu: bool = False
     supports_gpu: bool = True
     supports_gpu_parallel: bool = False
     supports_cpu_parallel: bool = False
 
-    requires_target: bool = True
+    # molecular model properties
+    requires_heavy_build: bool = False
     requires_seqs: bool = True
     requires_msa: bool = True
     requires_3d: bool = False
-    requires_fixed_length: bool = True
-    handles_deletions: bool = True
 
     def __init__(
         self,
@@ -54,13 +58,13 @@ class EVmutation2(BaseModel, Scorer, Generator):
         decoder_num_full_samples: int = 16,
         decoder_num_mutant_samples: int = 16,
         decoder_share_order_across_encodings: bool = True,
-        keep_model: bool = False,
+        keep_model_after_build: bool = False,
         device: DeviceType = "cpu",
     ):
         """
         Instantiate new EVcouplings2 model
 
-        TODO: support min_p sampling and sample_gaps
+        TODO: support min_p sampling and with extra parameters on generate() method
 
         Parameters
         ----------
@@ -80,20 +84,25 @@ class EVmutation2(BaseModel, Scorer, Generator):
             Number of sampled decoding orders when computing mutant scores
         decoder_share_order_across_encodings
             Reuse decoding order across multiple encodings (if more than 1 used)
-        keep_model
+        keep_model_after_build
             If True, keep model parameters asssociated to instance after build step
             to avoid reloading when scoring/generating. If serializing model, set to
             False to avoid storing model parameters repeatedly.
         device
             Device to use for computations
         """
-        super().__init__()
+        if not self.available:
+            raise ValueError("EVmutation2 package could not be imported. Is it installed already?")
+
         self.model_file_path = model_file_path
-        self.keep_model = keep_model
+        self.keep_model_after_build = keep_model_after_build
+
+        # by default, keep parameters loaded once loaded for prediction purposes to avoid reloading over and over
+        self.keep_model_after_pred = True
         self.device = device
 
         # modelled system
-        self.system = None
+        self._system = None
 
         # lazy-load model when needed
         self.model = None
@@ -120,20 +129,35 @@ class EVmutation2(BaseModel, Scorer, Generator):
         if self.decoder_batch_size == "auto":
             raise NotImplementedError("Automatic batch_size not yet implemented")
 
-        # encodings created when calling build() method
+        # encodings created when calling build() method;
+        # first for permanent association with object
         self.encoding = None
         self.pos_mask = None
+
+        self._single_rep_on_device = None
+        self._pair_rep_on_device = None
+        self._pos_mask_on_device = None
 
     @property
     def ready(self):
         return self.system is not None and self.encoding is not None
 
+    @property
+    def system(self) -> System | None:
+        return self._system
+
     @classmethod
-    def can_model(cls, system: System) -> Tuple[bool, str]:
+    def can_model(cls, system: System, data: None=None) -> Tuple[bool, str]:
+        if data is not None:
+            return False, "Model does not support data parameter (must be None)"
+
         if len(system) != 1 or system[0].type_ != "protein":
             return False, "Can only handle single-component protein system"
 
         target = system[0]
+        if not target.defined_sequence():
+            return False, "Entity must have defined rep sequence"
+
         if target.sequences is None or len(target.sequences.seqs) == 0:
             return False, "Must provide sequences for model inference"
 
@@ -141,10 +165,10 @@ class EVmutation2(BaseModel, Scorer, Generator):
             return False, "Provided sequences must be aligned"
 
         # this should be ensured by construction of system but check again to be safe
-        if not valid_protein_sequence(
-            target.rep, allow_mask=True, allow_gap=True, allow_ambiguous=True
-        ):
-            return False, "Input sequence may only contain AA symbols or mask"
+        # if not valid_protein_sequence(
+        #     target.rep, allow_mask=True, allow_gap=True, allow_ambiguous=True
+        # ):
+        #     return False, "Input sequence may only contain AA symbols or mask"
 
         # TODO: more checks on alignment: does length match target rep;
         #  and is alignment compatible with a3m format
@@ -155,18 +179,22 @@ class EVmutation2(BaseModel, Scorer, Generator):
     def required_resources(
         cls,
         system: System,
+        data: None = None,
         use_gpu: bool = True,
         build: bool = True,
     ) -> RequiredResources:
-        # TODO: implement meaningful requirements depending on target size instead of made up values
-        return RequiredResources(
-            min_gpu_cores=1,
-            min_gpu_memory_per_core=16000,
-            min_cpu_cores=1,
-            min_cpu_memory_per_core=16000,
-            max_batch_size=512,
-            time=1,
+        raise NotImplementedError(
+            "Resource estimation not yet implemented"
         )
+        # TODO: implement meaningful requirements depending on target size instead of made up values
+        # return RequiredResources(
+        #     min_gpu_cores=1,
+        #     min_gpu_memory_per_core=16000,
+        #     min_cpu_cores=1,
+        #     min_cpu_memory_per_core=16000,
+        #     max_batch_size=512,
+        #     time=1,
+        # )
 
     def _load_model(self):
         # avoid reloading if already loaded
@@ -193,13 +221,14 @@ class EVmutation2(BaseModel, Scorer, Generator):
     def build(
         self,
         system: System,
+        data: None = None,
         status_callback: StatusCallback | None = None
     ) -> Self:
         # verify if we can model the system
-        self.can_model_or_raise(system)
+        self.can_model_or_raise(system, data)
 
         # store system with this instance
-        self.system = system
+        self._system = system
         target = self.system[0]
 
         # load MSA
@@ -231,7 +260,7 @@ class EVmutation2(BaseModel, Scorer, Generator):
         self.pos_mask = input_features.pos_mask.cpu()
 
         # context for loading (and possibly destroying model parameters)
-        with model_param_context(self._load_model, self._delete_model, self.keep_model):
+        with model_param_context(self._load_model, self._delete_model, self.keep_model_after_build):
             with torch.no_grad():
                 s, p = [], []
                 # create requested number of encoder samples (single and pair representation)
@@ -248,6 +277,12 @@ class EVmutation2(BaseModel, Scorer, Generator):
                 s = torch.cat(s, dim=0)
                 p = torch.cat(p, dim=0)
 
+                # attach encodings to instance if we keep model parameters
+                if self.keep_model_after_build:
+                    self._single_rep_on_device = s
+                    self._pair_rep_on_device = p
+                    self._pos_mask_on_device = input_features.pos_mask
+
                 # store encodings, make sure these are moved to CPU for good serialization behaviour
                 self.encoding = (
                     s.cpu(), p.cpu()
@@ -260,23 +295,45 @@ class EVmutation2(BaseModel, Scorer, Generator):
         return self
 
     def positions(
-        self
+        self,
+        instance: SystemInstance | None = None,
     ) -> List[Tuple[int, int]]:
         self.ready_or_raise()
 
         # implementation here is very simple: we model all positions of exactly one target
-        # protein sequence; none of the positions along the sequence are excluded so
-        # we can simply enumerate starting from first_index
+        # protein sequence of fixed length (i.e. can ignore the passed instance);
+        # none of the positions along the sequence are excluded so we can simply enumerate starting from first_index
         target = self.system[0]
         return [
-            (0, idx) for idx, _ in enumerate(target.rep, start=target.first_index)
+            (0, pos) for pos, _ in enumerate(target.rep, start=target.first_index)
+        ]
+
+    def _validate_instances(
+        self,
+        instances: Sequence[SystemInstance],
+    ) -> None:
+        # validate instance sequences; must all have the same length
+        [
+            self.system.valid_instance(
+                instance,
+                validate_reps=True,
+                fixed_length=True,
+                allow_deletions=True,
+                raise_invalid=True,
+            ) for instance in instances
         ]
 
     @contextmanager
-    def _prepare(self) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def _reps_on_device(self, keep: bool = True) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Helper to move all necessary information to target device
         when calling inference methods
+
+        Parameters
+        ----------
+        keep
+            If True, keep single/pair representations on device after exiting the manager;
+            if False, remove them and clear cache where applicable
 
         Returns
         -------
@@ -285,18 +342,27 @@ class EVmutation2(BaseModel, Scorer, Generator):
         """
         # move representations and position mask to device
         try:
-            (s, p) = self.encoding
-            s = s.to(self.device)
-            p = p.to(self.device)
-            pos_mask = self.pos_mask.to(self.device)
-            assert s.shape[0] == p.shape[0], "Number of single and pair representations does not agree"
+            # reload representations if anything is missing
+            if (
+                self._pos_mask_on_device is None or
+                self._single_rep_on_device is None or
+                self._pair_rep_on_device is None
+            ):
+                (s, p) = self.encoding
+                assert s.shape[0] == p.shape[0], "Number of single and pair representations does not agree"
+                self._single_rep_on_device = s.to(self.device)
+                self._pair_rep_on_device = p.to(self.device)
+                self._pos_mask_on_device = self.pos_mask.to(self.device)
 
-            yield s, p, pos_mask
+            yield
         finally:
-            del s
-            del p
-            del pos_mask
-            self._release_cache()
+            # if not keeping representations, release them again and clear cache
+            if not keep:
+                self._single_rep_on_device = None
+                self._pair_rep_on_device = None
+                self._pos_mask_on_device = None
+                self._release_cache()
+                assert False, "Should not come here with current implementation"
 
     def generate(
         self,
@@ -304,10 +370,11 @@ class EVmutation2(BaseModel, Scorer, Generator):
         entities: Sequence[int] | None = None,
         fixed_pos: EntityPosList | None = None,
         temperature: float = 1.0,
+        deletions: bool = False,
         status_callback: StatusCallback | None = None
     ) -> List[SystemInstance]:
         """
-        TODO: support min_p sampling and sample_gaps parameters eventually
+        TODO: support min_p sampling parameter eventually
         """
         self.ready_or_raise()
 
@@ -319,7 +386,7 @@ class EVmutation2(BaseModel, Scorer, Generator):
                 raise ValueError("Can only design single entity (entities = [0] | None)")
         else:
             # not used for now
-            entities = [0]
+            entities = [0]  # noqa
 
         target = self.system[0]
 
@@ -330,9 +397,9 @@ class EVmutation2(BaseModel, Scorer, Generator):
                     "Only accepting position mapping for entity 0"
                 )
 
-            fixed_pos = set(fixed_pos[0])
             # verify if all positions are valid
-            self.valid_positions(fixed_pos, entity=0, raise_invalid=True)
+            self.valid_positions(fixed_pos[0], entities=0, raise_invalid=True)
+            fixed_pos = set(fixed_pos[0])
         else:
             fixed_pos = set()
 
@@ -348,8 +415,8 @@ class EVmutation2(BaseModel, Scorer, Generator):
         ]
 
         with (
-            model_param_context(self._load_model, self._delete_model, self.keep_model),
-            self._prepare() as (s, p, pos_mask)
+            model_param_context(self._load_model, self._delete_model, self.keep_model_after_pred),
+            self._reps_on_device(self.keep_model_after_pred)
         ):
             # sampling function expects number of designs to be a multiple of batch_size,
             # so adjust accordingly
@@ -366,22 +433,23 @@ class EVmutation2(BaseModel, Scorer, Generator):
             # note: method has @torch.inference_mode() so no_grad not necessary here
             # TODO: update sampling method to update generation status dynamically with callback
             designs, _ = self.model.decoder.sample_inefficient(
-                single=s,
-                pairwise=p,
-                pos_mask=pos_mask,
+                single=self._single_rep_on_device,
+                pairwise=self._pair_rep_on_device,
+                pos_mask=self._pos_mask_on_device,
                 seq=base_seq,
                 batch_size=self.decoder_batch_size,
                 num_samples=num_designs_adj,
                 temperature=temperature,
+                sample_gaps=deletions,
                 # min_p=None,  # TODO: implement
-                # sample_gaps=None,  # TODO: implement
             )
 
         # score the designs relative to entity sequence (ideally, user supplied WT sequence, but user can
         # always rescore the designs later if needed)
 
-        # prepend reference sequence, and create instances
-        ref_and_designs = [target.rep] + list(designs.seq)
+        # prepend reference sequence, and create instances;
+        # note ref_and_designs is list[str] that is transformed to np array by EntityInstance constructor
+        ref_and_designs = ["".join(target.rep)] + list(designs.seq)
         instances = [
             SystemInstance(
                 EntityInstance(rep=rep)
@@ -412,21 +480,23 @@ class EVmutation2(BaseModel, Scorer, Generator):
         self.ready_or_raise()
 
         # validate sequences
-        _ = (
-            self.system.valid_instance(
-                instance, fixed_length=True, validate_reps=True, raise_invalid=True
-            ) for instance in instances
-        )
+        self._validate_instances(instances)
 
         with (
-            model_param_context(self._load_model, self._delete_model, self.keep_model),
-            self._prepare() as (s, p, pos_mask)
+            model_param_context(self._load_model, self._delete_model, self.keep_model_after_pred),
+            self._reps_on_device(self.keep_model_after_pred)
         ):
+            # note that score_full_probability could also handle numpy arrays but not yet documented,
+            # so turn into list[str] for due diligence
+            str_instances = [
+                "".join(instance[0].rep) for instance in instances
+            ]
+
             scores = self.model.decoder.score_full_probability(
-                [instance[0].rep for instance in instances],
-                single=s,
-                pairwise=p,
-                pos_mask=pos_mask,
+                str_instances,
+                single=self._single_rep_on_device,
+                pairwise=self._pair_rep_on_device,
+                pos_mask=self._pos_mask_on_device,
                 batch_size=self.decoder_batch_size,
                 num_samples=self.decoder_num_full_samples,
                 share_decoding_order_across_encodings=self.decoder_share_order_across_encodings,
@@ -446,7 +516,7 @@ class EVmutation2(BaseModel, Scorer, Generator):
     def single_mutation_scan(
         self,
         instance: SystemInstance,
-        entity: int = 0,
+        entity: int | None = None,
         positions: Sequence[int] | None = None,
         status_callback: StatusCallback | None = None
     ) -> pd.DataFrame:
@@ -458,10 +528,14 @@ class EVmutation2(BaseModel, Scorer, Generator):
 
         # check instance against molecular system, requiring fixed length of sequence
         # as was used for entity specification as we have a fixed-length model
-        self.system.valid_instance(
-            instance, fixed_length=True, validate_reps=True, raise_invalid=True,
-        )
+        self._validate_instances([instance])
 
+        if positions is not None and entity is None:
+            raise ValueError(
+                "Parameter entity must be explicitly specified if using parameter positions"
+            )
+
+        entity = 0 if entity is None else entity
         if entity != 0:
             raise ValueError("Model can only handle one single entity")
 
@@ -472,14 +546,14 @@ class EVmutation2(BaseModel, Scorer, Generator):
 
         # validate positions
         if positions is not None:
-            positions = self.valid_positions(positions, raise_invalid=True)
+            self.valid_positions(positions, entities=0, raise_invalid=True)
 
         with (
-            model_param_context(self._load_model, self._delete_model, self.keep_model),
-            self._prepare() as (s, p, pos_mask)
+            model_param_context(self._load_model, self._delete_model, self.keep_model_after_pred),
+            self._reps_on_device()
         ):
             # get number of encoder samples (single/pair representations)
-            num_encodings = s.shape[0]
+            num_encodings = self._single_rep_on_device.shape[0]
 
             # iterate through encoder samples; we can average these as these are log-odds scores, i.e.
             # different decoding orders will already have cancelled out. ultimately, this functionality should
@@ -490,9 +564,9 @@ class EVmutation2(BaseModel, Scorer, Generator):
                 effects[idx_enc] = self.model.decoder.score_single_mutants(
                     seq=instance_seq,
                     first_index=target.first_index,
-                    single=s[[idx_enc]],
-                    pairwise=p[[idx_enc]],
-                    pos_mask=pos_mask,
+                    single=self._single_rep_on_device[[idx_enc]],
+                    pairwise=self._pair_rep_on_device[[idx_enc]],
+                    pos_mask=self._pos_mask_on_device,
                     position_subset=positions,
                     num_samples=self.decoder_num_mutant_samples,
                     batch_size=self.decoder_batch_size,
@@ -509,7 +583,7 @@ class EVmutation2(BaseModel, Scorer, Generator):
         ).groupby(
             level=["pos", "wt_aa"]
         ).mean().reindex(
-            VALID_AA_OR_GAP_SORTED, axis=1
+            target.alphabet(include_gap=True), axis=1
         )
 
         effects.index.names = ["pos", "ref"]
@@ -536,13 +610,11 @@ class EVmutation2(BaseModel, Scorer, Generator):
 
         # check instance against molecular system, requiring fixed length of sequence
         # as was used for entity specification as we have a fixed-length model
-        self.system.valid_instance(
-            instance, fixed_length=True, validate_reps=True, raise_invalid=True,
-        )
+        self._validate_instances([instance])
 
         # verify if mutants are valid relative to system and instance
         self.system.valid_mutants(
-            instance, mutants, allow_gap=False, raise_invalid=True
+            instance, mutants, deletions=True, insertions=False, raise_invalid=True
         )
 
         # extract single target entity from system, and get sequence from instance
@@ -558,11 +630,11 @@ class EVmutation2(BaseModel, Scorer, Generator):
         ]
 
         with (
-            model_param_context(self._load_model, self._delete_model, self.keep_model),
-            self._prepare() as (s, p, pos_mask)
+            model_param_context(self._load_model, self._delete_model, self.keep_model_after_pred),
+            self._reps_on_device()
         ):
             # get number of encoder samples (single/pair representations)
-            num_encodings = s.shape[0]
+            num_encodings = self._single_rep_on_device.shape[0]
 
             # iterate through encoder samples; we can average these as these are log-odds scores, i.e.
             # different decoding orders will already have cancelled out. ultimately, this functionality should
@@ -574,9 +646,9 @@ class EVmutation2(BaseModel, Scorer, Generator):
                     seq=instance_seq,
                     mutants=mutants_transformed,
                     first_index=target.first_index,
-                    single=s[[idx_enc]],
-                    pairwise=p[[idx_enc]],
-                    pos_mask=pos_mask,
+                    single=self._single_rep_on_device[[idx_enc]],
+                    pairwise=self._pair_rep_on_device[[idx_enc]],
+                    pos_mask=self._pos_mask_on_device,
                     num_samples=self.decoder_num_mutant_samples,
                     batch_size=self.decoder_batch_size,
                 )
@@ -603,11 +675,7 @@ class EVmutation2(BaseModel, Scorer, Generator):
         self.ready_or_raise()
 
         # validate instance sequences
-        [
-            self.system.valid_instance(
-                instance, fixed_length=True, validate_reps=True, raise_invalid=True
-            ) for instance in instances
-        ]
+        self._validate_instances(instances)
 
         # validate entity specification (only handle single entity for now)
         if set(entities) != {0}:
@@ -619,24 +687,25 @@ class EVmutation2(BaseModel, Scorer, Generator):
         target = self.system[0]
 
         # validate positions
-        self.valid_positions(positions, entity=0, raise_invalid=True)
+        self.valid_positions(positions, entities=0, raise_invalid=True)
 
-        # extract sequences
+        # extract sequences;
+        # note: could also pass numpy rep directly but use proper signature for due diligence
         seqs = [
-            instance[0].rep for instance in instances
+            "".join(instance[0].rep) for instance in instances
         ]
 
         with (
-            model_param_context(self._load_model, self._delete_model, self.keep_model),
-            self._prepare() as (s, p, pos_mask)
+            model_param_context(self._load_model, self._delete_model, self.keep_model_after_pred),
+            self._reps_on_device()
         ):
             scores = self.model.decoder.score_conditional(
                 seqs=seqs,
                 positions=positions,
                 first_index=target.first_index,
-                single=s,
-                pairwise=p,
-                pos_mask=pos_mask,
+                single=self._single_rep_on_device,
+                pairwise=self._pair_rep_on_device,
+                pos_mask=self._pos_mask_on_device,
                 batch_size=self.decoder_batch_size,
                 num_samples=self.decoder_num_mutant_samples,
                 share_decoding_order_across_encodings=self.decoder_share_order_across_encodings,
@@ -646,13 +715,15 @@ class EVmutation2(BaseModel, Scorer, Generator):
         conditionals = scores.groupby(
             level=["seq_idx", "pos"], sort=False
         ).mean().reindex(
-            VALID_AA_OR_GAP_SORTED, axis=1
+            target.alphabet(include_gap=True), axis=1
         )
-        conditionals.index.names =["seq", "pos"]
+        conditionals.index.names =["instance", "pos"]
 
-        # add entity 0 to index
+        # add entity 0 to index, then move instance index to outermost level
         conditionals = pd.concat(
             {0: conditionals}, names=["entity"]
+        ).swaplevel(
+            i=0, j=1, axis=0
         )
 
         assert len(conditionals) == len(entities), "Length mismatch between output and input"
