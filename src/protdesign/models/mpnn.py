@@ -128,13 +128,6 @@ class LigandMPNNWrapper:
         self.model.to(self.device)
         self.model.eval()
 
-    def ready_or_raise(self):
-        """Check if the model is ready (built) or raise an error"""
-        if not self._is_built:
-            raise RuntimeError(
-                "Model not built. Call build(system) before generate() or score()"
-            )
-
     def build(self,
               system: System,
               ligand_cutoff: float = 8.0) -> 'LigandMPNNWrapper':
