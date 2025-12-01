@@ -21,7 +21,7 @@ classifiers = [
   "Programming Language :: Python :: Implementation :: CPython",
   "Programming Language :: Python :: Implementation :: PyPy",
 ]
-dependencies = ["numpy", "pandas", "torch", "loguru", "biotite", "biopython", "dnachisel", "scikit-learn", "numba"]
+dependencies = ["numpy", "pandas", "torch", "loguru", "biotite", "biopython", "dnachisel", "scikit-learn", "numba", "prody"]
 
 [project.optional-dependencies]
 evmutation2 = ["picasso_model"]
