@@ -41,7 +41,7 @@ class LigandMPNNWrapper:
     def __init__(self,
                  model_type: str = "ligand_mpnn",
                  checkpoint_path: str | None = None,
-                 device: str | None = None,
+                 device: torch.device | None = None,
                  batch_size: int = 1,
                  seed: int | None = None,
                  use_ligand_context: bool = True):
