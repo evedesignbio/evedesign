@@ -2,25 +2,29 @@ import numpy as np
 import torch
 import tempfile
 import os
-from typing import List, Dict, Sequence, Callable
+from typing import List, Dict, Sequence, Tuple, Optional, Self
+from pathlib import Path
+
+from protdesign.model import (
+    BaseModel, Scorer, Generator, RequiredResources
+)
 from protdesign.entity import System, SystemInstance, EntityInstance
 from protdesign.entity import EntityPosList
-from pathlib import Path
-from typing import Self, Tuple, Sequence, List, Optional
 from protdesign.utils import ensure_sequence
+from protdesign.types import DeviceType, StatusCallback, BatchSize
+
 # Import the LigandMPNN modules
-from ligandmpnn.data_utils import (
+from protdesign.models.ligandmpnn.data_utils import (
     featurize,
     parse_PDB,
     restype_str_to_int,
     restype_int_to_str,
     get_score,
-    get_seq_rec
 )
-from ligandmpnn.model_utils import ProteinMPNN
+from protdesign.models.ligandmpnn.model_utils import ProteinMPNN
 
 
-class LigandMPNNWrapper:
+class LigandMPNNWrapper(BaseModel, Scorer, Generator):
     """
     Wrapper for LigandMPNN that works with System objects.
 
@@ -31,13 +35,33 @@ class LigandMPNNWrapper:
         scores = wrapper.score(instances)
     """
 
+    available = True
+    name: str = "LigandMPNN"
+
+    # core properties
+    requires_target: bool = True
+    requires_fixed_length: bool = False
+    handles_deletions: bool = False
+    handles_insertions: bool = False
+    requires_gpu: bool = False
+    supports_gpu: bool = True
+    supports_gpu_parallel: bool = False
+    supports_cpu_parallel: bool = False
+
+    # molecular model properties
+    requires_heavy_build: bool = False
+    requires_seqs: bool = False
+    requires_msa: bool = False
+    requires_3d: bool = True
+
     def __init__(self,
                  model_type: str = "ligand_mpnn",
                  checkpoint_path: str | None = None,
-                 device: torch.device | None = None,
-                 batch_size: int = 1,
+                 device: DeviceType | None = None,
+                 batch_size: BatchSize = 1,
                  seed: int | None = None,
-                 use_ligand_context: bool = True):
+                 use_ligand_context: bool = True,
+                 keep_model_after_build: bool = False):
         """
         Initialize the LigandMPNN wrapper.
 
@@ -48,6 +72,7 @@ class LigandMPNNWrapper:
             batch_size: Batch size for sequence generation
             seed: Random seed for sequence generation
             use_ligand_context: Whether to use ligand context
+            keep_model_after_build: Whether to keep model loaded after build
         """
         self.model_type = model_type
         self.device = device or (
@@ -55,6 +80,7 @@ class LigandMPNNWrapper:
         self.batch_size = batch_size
         self.seed = seed
         self.use_ligand_context = use_ligand_context
+        self.keep_model_after_build = keep_model_after_build
 
         # Set default checkpoint paths
         if checkpoint_path is None:
@@ -70,7 +96,7 @@ class LigandMPNNWrapper:
         self.model = None
 
         # State that gets set during build()
-        self.system = None
+        self._system = None
         self.feature_dict = None
         self.entity_lengths = None
         self.chain_mapping = None
@@ -78,9 +104,44 @@ class LigandMPNNWrapper:
         self.symmetry_weights = None
         self.native_seq = None
         self.pdb_path = None
-        self._is_built = False
+        self.pdb_chain_info = None
+        self.pdb_to_entity_mapping = None  # NEW: Map PDB positions to entity positions
 
         self._load_model()
+
+    @property
+    def ready(self):
+        return self._system is not None
+
+    @property
+    def system(self) -> System | None:
+        return self._system
+
+    @classmethod
+    def can_model(cls, system: System, data: None = None) -> Tuple[bool, str]:
+        if data is not None:
+            return False, "Model does not support data parameter (must be None)"
+
+        # Check that all entities are proteins with structures
+        for entity in system:
+            if entity.type_ != "protein":
+                return False, "Can only handle protein entities"
+            if not entity.structures:
+                return False, "All entities must have 3D structures"
+
+        return True, ""
+
+    @classmethod
+    def required_resources(
+        cls,
+        system: System,
+        data: None = None,
+        use_gpu: bool = True,
+        build: bool = True,
+    ) -> RequiredResources:
+        raise NotImplementedError(
+            "Resource estimation not yet implemented"
+        )
 
     def _load_model(self):
         """Load the model from checkpoint"""
@@ -123,18 +184,23 @@ class LigandMPNNWrapper:
 
     def build(self,
               system: System,
-              ligand_cutoff: float = 8.0) -> 'LigandMPNNWrapper':
+              data: None = None,
+              ligand_cutoff: float = 8.0,
+              status_callback: StatusCallback | None = None) -> Self:
         """
         Build/prepare the system for sequence generation.
 
         Args:
             system: System object containing protein entities and structures
+            data: Not used, must be None
             ligand_cutoff: Distance cutoff for ligand context
+            status_callback: Optional callback for status updates
 
         Returns:
             self for method chaining
         """
-        self.system = system
+        self.can_model_or_raise(system, data)
+        self._system = system
 
         # Get entity sequence lengths
         self.entity_lengths = [(idx, len(entity.rep) if entity.rep is not None else 0)
@@ -152,12 +218,30 @@ class LigandMPNNWrapper:
             parse_atoms_with_zero_occupancy=False,
         )
 
+        # Store PDB chain information
+        chain_list = protein_dict['chain_list']
+        mask_c = protein_dict['mask_c']
+
+        self.pdb_chain_info = {}
+        for i, chain_id in enumerate(chain_list):
+            chain_mask = mask_c[i]
+            chain_length = chain_mask.sum().item()
+            self.pdb_chain_info[chain_id] = {
+                'index': i,
+                'length': chain_length,
+                'mask': chain_mask
+            }
+
         # Create mappings
         self.chain_mapping = self._create_chain_mapping(system)
 
+        # Create PDB-to-entity position mapping
+        self.pdb_to_entity_mapping = self._create_pdb_to_entity_mapping(
+            system, protein_dict)
+
         # Determine homo-oligomer symmetry if applicable
         self.symmetry_residues, self.symmetry_weights = self._determine_homooligomer_symmetry(
-            system)
+            system, protein_dict)
 
         # Set up chain mask (which residues to design)
         chain_mask = torch.ones_like(protein_dict["mask"], dtype=torch.float32)
@@ -177,8 +261,20 @@ class LigandMPNNWrapper:
             restype_int_to_str[aa] for aa in self.feature_dict["S"][0].cpu().numpy()
         ])
 
-        self._is_built = True
         return self
+
+    def positions(
+        self,
+        instance: SystemInstance | None = None,
+    ) -> List[Tuple[int, int]]:
+        """Get all designable positions in the system."""
+        self.ready_or_raise()
+        positions = []
+        for entity_idx, entity in enumerate(self.system):
+            if entity.rep is not None:
+                for pos in range(len(entity.rep)):
+                    positions.append((entity_idx, pos))
+        return positions
 
     def _system_to_pdb_file(self, system: System) -> str:
         """Convert a System object to a temporary PDB file."""
@@ -204,11 +300,6 @@ class LigandMPNNWrapper:
                 if not isinstance(entity_chains, list):
                     entity_chains = [entity_chains]
                 all_chains.extend(entity_chains)
-                entity_id = entity.id_ or f'entity_{len(all_chains)}'
-                print(
-                    f"Adding chains from entity {entity_id}: {len(entity_chains)} chains")
-
-        print(f"Total chains to write: {len(all_chains)}")
 
         # Write combined structure to PDB file
         if all_chains:
@@ -252,21 +343,62 @@ class LigandMPNNWrapper:
                             raise NotImplementedError(
                                 "Cannot write PDB - Structure class missing to_file or to_pdb_string method")
 
-        print(temp_path)
         return temp_path
+
+    def _create_pdb_to_entity_mapping(self, system: System, protein_dict: Dict) -> Dict:
+        """
+        Create mapping from PDB residue positions to entity (idx, pos) tuples.
+        This handles cases where PDB chains may be shorter than entity sequences.
+        """
+        mapping = {}
+        chain_list = protein_dict['chain_list']
+        mask_c = protein_dict['mask_c']
+
+        current_pdb_pos = 0
+        for entity_idx, entity in enumerate(system):
+            if entity.structures:
+                for structure_key, chains in entity.structures.items():
+                    if not isinstance(chains, list):
+                        chains = [chains]
+
+                    for chain_idx, _ in enumerate(chains):
+                        # Get the actual chain length from PDB
+                        if chain_idx < len(chain_list):
+                            chain_length = mask_c[chain_idx].sum().item()
+
+                            # Map each PDB position to entity position
+                            # Assuming chains correspond to same sequence positions
+                            for pos_in_chain in range(chain_length):
+                                pdb_pos = current_pdb_pos + pos_in_chain
+                                mapping[pdb_pos] = (entity_idx, pos_in_chain)
+
+                            current_pdb_pos += chain_length
+
+        return mapping
 
     def _split_concatenated_sequences(self, concatenated_sequences: List[str],
                                       entity_lengths: List[Tuple[int, int]]) -> Dict[int, List[str]]:
-        """Split concatenated sequences back into per-entity sequences."""
+        """
+        Split concatenated sequences back into per-entity sequences.
+        Now handles the case where PDB sequence != entity sequence due to missing residues.
+        """
         separated_sequences = {entity_idx: []
                                for entity_idx, _ in entity_lengths}
 
         for concat_seq in concatenated_sequences:
-            start_pos = 0
-            for entity_idx, length in entity_lengths:
-                entity_seq = concat_seq[start_pos:start_pos + length]
-                separated_sequences[entity_idx].append(entity_seq)
-                start_pos += length
+            # Use the PDB-to-entity mapping to properly split sequences
+            for entity_idx, entity_length in entity_lengths:
+                # Initialize entity sequence with gaps
+                entity_seq = ['X'] * entity_length
+
+                # Fill in positions that exist in PDB
+                for pdb_pos, aa in enumerate(concat_seq):
+                    if pdb_pos in self.pdb_to_entity_mapping:
+                        mapped_entity_idx, entity_pos = self.pdb_to_entity_mapping[pdb_pos]
+                        if mapped_entity_idx == entity_idx and entity_pos < entity_length:
+                            entity_seq[entity_pos] = aa
+
+                separated_sequences[entity_idx].append(''.join(entity_seq))
 
         return separated_sequences
 
@@ -290,30 +422,49 @@ class LigandMPNNWrapper:
                             chain_id = getattr(chain, 'id', f'chain_{idx}')
 
                         chain_to_entity[chain_id] = entity_id
-                        print(f"Mapped chain {chain_id} to entity {entity_id}")
 
         return chain_to_entity
 
-    def _determine_homooligomer_symmetry(self, system: System) -> Tuple[List[List[int]], List[List[float]]]:
-        """Determine symmetry constraints for homo-oligomers."""
+    def _determine_homooligomer_symmetry(self, system: System, protein_dict: Dict) -> Tuple[List[List[int]], List[List[float]]]:
+        """Determine symmetry constraints for homo-oligomers using ACTUAL PDB chain lengths."""
         symmetry_residues = []
         symmetry_weights = []
 
-        for entity in system:
+        # Get chain information from parsed PDB
+        chain_list = protein_dict['chain_list']
+        mask_c = protein_dict['mask_c']
+
+        for entity_idx, entity in enumerate(system):
             if entity.structures:
                 for structure_key, chains in entity.structures.items():
                     if not isinstance(chains, list):
                         chains = [chains]
 
                     if len(chains) > 1:  # Homo-oligomer
-                        seq_length = len(
-                            entity.rep) if entity.rep is not None else 0
-                        for pos in range(seq_length):
+                        # Get actual chain lengths from PDB
+                        pdb_chain_lengths = []
+
+                        for i in range(len(chain_list)):
+                            chain_length = mask_c[i].sum().item()
+                            pdb_chain_lengths.append(chain_length)
+
+                        # Calculate cumulative positions for each chain
+                        chain_start_positions = [0]
+                        for length in pdb_chain_lengths[:-1]:
+                            chain_start_positions.append(
+                                chain_start_positions[-1] + length)
+
+                        # Use minimum chain length to avoid out-of-bounds
+                        min_chain_length = min(pdb_chain_lengths)
+
+                        # Create symmetry groups based on actual chain positions
+                        for pos in range(min_chain_length):
                             residue_group = []
                             weight_group = []
 
-                            for i, _ in enumerate(chains):
-                                residue_group.append(pos + i * seq_length)
+                            for chain_idx, start_pos in enumerate(chain_start_positions):
+                                residue_idx = start_pos + pos
+                                residue_group.append(residue_idx)
                                 weight_group.append(1.0 / len(chains))
 
                             symmetry_residues.append(residue_group)
@@ -335,18 +486,13 @@ class LigandMPNNWrapper:
             self.feature_dict["mask"], dtype=torch.float32)
 
         if fixed_pos is not None:
-            # Start position for each entity in the concatenated sequence
-            entity_starts = {}
-            current_pos = 0
-            for idx, (entity_id, length) in enumerate(self.entity_lengths):
-                entity_starts[idx] = current_pos
-                current_pos += length
-
-            # Set fixed positions to 0
+            # Use PDB-to-entity mapping to convert entity positions to PDB positions
             for entity_idx, positions in fixed_pos.items():
-                start_pos = entity_starts[entity_idx]
-                for pos in positions:
-                    chain_mask[0, start_pos + pos] = 0.0
+                for entity_pos in positions:
+                    # Find corresponding PDB position(s)
+                    for pdb_pos, (mapped_entity_idx, mapped_entity_pos) in self.pdb_to_entity_mapping.items():
+                        if mapped_entity_idx == entity_idx and mapped_entity_pos == entity_pos:
+                            chain_mask[0, pdb_pos] = 0.0
 
         return chain_mask
 
@@ -365,12 +511,13 @@ class LigandMPNNWrapper:
         entities: Sequence[int] | None = None,
         fixed_pos: EntityPosList | None = None,
         temperature: float = 0.1,
-        batch_size: int = 1,
+        batch_size: int | None = None,
         seed: Optional[int] = None,
         amino_acid_bias: Optional[Dict[str, float]] = None,
         omit_amino_acids: Optional[str] = None,
         use_ligand_context: bool = True,
-        status_callback: Callable[[str], None] | None = None
+        deletions: bool = False,
+        status_callback: StatusCallback | None = None
     ) -> List[SystemInstance]:
         """
         Generate new sequences for the built structure and optionally score them.
@@ -385,6 +532,7 @@ class LigandMPNNWrapper:
             amino_acid_bias: Global amino acid biases
             omit_amino_acids: Amino acids to omit globally
             use_ligand_context: Whether to use ligand context
+            deletions: Not supported, must be False
             status_callback: Optional callback for status updates
 
         Returns:
@@ -392,6 +540,13 @@ class LigandMPNNWrapper:
         """
         # 1. Check model is ready
         self.ready_or_raise()
+
+        if deletions:
+            raise ValueError("LigandMPNN does not support deletions")
+
+        # Use instance batch_size if not provided
+        if batch_size is None:
+            batch_size = self.batch_size
 
         # 2. Set random seed
         if seed is not None:
@@ -467,27 +622,34 @@ class LigandMPNNWrapper:
             # Calculate individual entity recoveries
             for entity_idx, (entity_id, length) in enumerate(self.entity_lengths):
                 generated_seq = separated_sequences[entity_idx][design_idx]
-                native_seq = self.native_seq[sum(length for (_, length) in self.entity_lengths[:entity_idx]):sum(
-                    length for (_, length) in self.entity_lengths[:entity_idx+1])]
 
-                # Calculate recovery
-                matches = sum(1 for a, b in zip(
-                    native_seq, generated_seq) if a == b)
-                recovery = matches / len(native_seq)
+                # For recovery calculation, only compare positions that exist in PDB
+                if self.system[entity_idx].rep is not None:
+                    native_entity_seq = str(self.system[entity_idx].rep)
+                    matches = sum(1 for i, (a, b) in enumerate(zip(native_entity_seq, generated_seq))
+                                  if a == b and b != 'X')
+                    non_missing = sum(1 for aa in generated_seq if aa != 'X')
+                    recovery = matches / non_missing if non_missing > 0 else 0.0
+                else:
+                    recovery = 0.0
 
                 # Create EntityInstance
-                # Ensure rep is a string, not a numpy array
                 entity_instance = EntityInstance(
-                    rep=''.join(generated_seq) if hasattr(
-                        generated_seq, 'tolist') else generated_seq
+                    rep=generated_seq
                 )
 
                 entity_instances.append(entity_instance)
 
             # Calculate overall recovery
-            overall_matches = sum(1 for a, b in zip(self.native_seq, "".join(
-                str(inst.rep) for inst in entity_instances)) if a == b)
-            overall_recovery = overall_matches / len(self.native_seq)
+            full_generated = "".join(str(inst.rep)
+                                     for inst in entity_instances)
+            full_native = "".join(
+                str(self.system[i].rep) for i in range(len(self.system)))
+            overall_matches = sum(1 for a, b in zip(full_native, full_generated)
+                                  if a == b and b != 'X')
+            overall_non_missing = sum(1 for aa in full_generated if aa != 'X')
+            overall_recovery = overall_matches / \
+                overall_non_missing if overall_non_missing > 0 else 0.0
 
             # Create SystemInstance
             system_instance = SystemInstance(
@@ -517,7 +679,7 @@ class LigandMPNNWrapper:
     def score(
         self,
         instances: Sequence[SystemInstance],
-        status_callback: Callable[[str], None] | None = None
+        status_callback: StatusCallback | None = None
     ) -> np.ndarray:
         """
         Score sequences against the built structure.
@@ -532,16 +694,23 @@ class LigandMPNNWrapper:
         # 1. Check model is ready
         self.ready_or_raise()
 
-        # 2. Extract sequences from instances
+        # 2. Extract sequences from instances and convert to PDB positions
         sequences = []
         for instance in instances:
-            # Ensure each instance's rep is converted to a string
-            concat_seq = "".join([
-                ''.join(inst.rep) if hasattr(
-                    inst.rep, 'tolist') else str(inst.rep)
-                for inst in instance
-            ])
-            sequences.append(concat_seq)
+            # Reconstruct full PDB sequence (length = total PDB residues)
+            pdb_length = len(self.native_seq)
+            pdb_seq = ['X'] * pdb_length
+
+            # Fill in the PDB sequence from entity sequences
+            for entity_idx, entity_instance in enumerate(instance):
+                entity_seq = str(entity_instance.rep)
+
+                # Map entity positions back to PDB positions
+                for pdb_pos, (mapped_entity_idx, entity_pos) in self.pdb_to_entity_mapping.items():
+                    if mapped_entity_idx == entity_idx and entity_pos < len(entity_seq):
+                        pdb_seq[pdb_pos] = entity_seq[entity_pos]
+
+            sequences.append(''.join(pdb_seq))
 
         # 3. Score each sequence
         scores = []
