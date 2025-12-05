@@ -7,7 +7,7 @@ from protdesign.entity import System, SystemInstance, EntityInstance
 from protdesign.entity import EntityPosList
 from pathlib import Path
 from typing import Self, Tuple, Sequence, List, Optional
-
+from protdesign.utils import ensure_sequence
 # Import the LigandMPNN modules
 from ligandmpnn.data_utils import (
     featurize,
@@ -18,13 +18,6 @@ from ligandmpnn.data_utils import (
     get_seq_rec
 )
 from ligandmpnn.model_utils import ProteinMPNN
-
-
-def ensure_sequence(value):
-    """Convert single values to sequences"""
-    if isinstance(value, (list, tuple)):
-        return value
-    return [value]
 
 
 class LigandMPNNWrapper:
