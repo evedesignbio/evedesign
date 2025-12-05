@@ -99,13 +99,12 @@ class LigandMPNNWrapper(BaseModel, Scorer, Generator):
         self._system = None
         self.feature_dict = None
         self.entity_lengths = None
-        self.chain_mapping = None
         self.symmetry_residues = None
         self.symmetry_weights = None
         self.native_seq = None
         self.pdb_path = None
-        self.pdb_chain_info = None
-        self.pdb_to_entity_mapping = None  # NEW: Map PDB positions to entity positions
+        self.pdb_to_entity_mapping = None  # Map PDB positions to entity positions
+        self.entity_to_pdb_chains = None  # Map entity_idx to list of PDB chain IDs
 
         self._load_model()
 
@@ -206,8 +205,10 @@ class LigandMPNNWrapper(BaseModel, Scorer, Generator):
         self.entity_lengths = [(idx, len(entity.rep) if entity.rep is not None else 0)
                                for idx, entity in enumerate(system)]
 
-        # Convert system to PDB file
-        self.pdb_path = self._system_to_pdb_file(system)
+        # Convert system to PDB file and build mappings simultaneously
+        self.pdb_path, self.pdb_to_entity_mapping, self.entity_to_pdb_chains = (
+            self._system_to_pdb_file(system)
+        )
 
         # Parse PDB with LigandMPNN
         protein_dict, backbone, other_atoms, icodes, _ = parse_PDB(
@@ -218,30 +219,10 @@ class LigandMPNNWrapper(BaseModel, Scorer, Generator):
             parse_atoms_with_zero_occupancy=False,
         )
 
-        # Store PDB chain information
-        chain_list = protein_dict['chain_list']
-        mask_c = protein_dict['mask_c']
-
-        self.pdb_chain_info = {}
-        for i, chain_id in enumerate(chain_list):
-            chain_mask = mask_c[i]
-            chain_length = chain_mask.sum().item()
-            self.pdb_chain_info[chain_id] = {
-                'index': i,
-                'length': chain_length,
-                'mask': chain_mask
-            }
-
-        # Create mappings
-        self.chain_mapping = self._create_chain_mapping(system)
-
-        # Create PDB-to-entity position mapping
-        self.pdb_to_entity_mapping = self._create_pdb_to_entity_mapping(
-            system, protein_dict)
-
-        # Determine homo-oligomer symmetry if applicable
-        self.symmetry_residues, self.symmetry_weights = self._determine_homooligomer_symmetry(
-            system, protein_dict)
+        # Build symmetry constraints directly from entity_to_pdb_chains
+        self.symmetry_residues, self.symmetry_weights = (
+            self._build_symmetry_from_chains(protein_dict)
+        )
 
         # Set up chain mask (which residues to design)
         chain_mask = torch.ones_like(protein_dict["mask"], dtype=torch.float32)
@@ -276,8 +257,13 @@ class LigandMPNNWrapper(BaseModel, Scorer, Generator):
                     positions.append((entity_idx, pos))
         return positions
 
-    def _system_to_pdb_file(self, system: System) -> str:
-        """Convert a System object to a temporary PDB file."""
+    def _system_to_pdb_file(self, system: System) -> Tuple[str, Dict, Dict]:
+        """
+        Convert a System object to a temporary PDB file.
+
+        Returns:
+            Tuple of (pdb_path, pdb_to_entity_mapping, entity_to_pdb_chains)
+        """
         temp_fd, temp_path = tempfile.mkstemp(suffix='.pdb')
         os.close(temp_fd)
 
@@ -292,185 +278,221 @@ class LigandMPNNWrapper(BaseModel, Scorer, Generator):
 
         structure_key = list(structure_keys)[0] if structure_keys else None
 
-        # Collect all chains from all entities for this structure
-        all_chains = []
-        for entity in system:
-            if entity.structures and structure_key in entity.structures:
-                entity_chains = entity.structures[structure_key]
-                if not isinstance(entity_chains, list):
-                    entity_chains = [entity_chains]
-                all_chains.extend(entity_chains)
+        # Track which entity each chain belongs to
+        chain_to_entity = {}  # chain_id -> entity_idx
+        entity_to_pdb_chains = {i: [] for i in range(len(system))}
 
-        # Write combined structure to PDB file
-        if all_chains:
-            if hasattr(all_chains[0], 'to_file') and len(all_chains) == 1:
-                all_chains[0].to_file(temp_path, format="pdb")
-            elif hasattr(all_chains[0], 'to_file'):
-                try:
-                    combined_structure = all_chains[0]
-                    for chain in all_chains[1:]:
-                        if hasattr(combined_structure, 'add_chain'):
-                            combined_structure.add_chain(chain)
-                        else:
-                            raise NotImplementedError(
-                                "Need to implement chain combination")
-                    combined_structure.to_file(temp_path, format="pdb")
-                except (AttributeError, NotImplementedError):
-                    temp_files = []
-                    for i, chain in enumerate(all_chains):
-                        temp_fd, temp_chain_path = tempfile.mkstemp(
-                            suffix=f'_chain{i}.pdb')
-                        os.close(temp_fd)
-                        chain.to_file(temp_chain_path, format="pdb")
-                        temp_files.append(temp_chain_path)
-
-                    with open(temp_path, 'w') as outfile:
-                        for temp_file in temp_files:
-                            with open(temp_file, 'r') as infile:
-                                for line in infile:
-                                    if line.startswith(('ATOM', 'HETATM', 'TER', 'END')):
-                                        outfile.write(line)
-
-                    for temp_file in temp_files:
-                        if os.path.exists(temp_file):
-                            os.unlink(temp_file)
+        # Use single letter chain IDs: A, B, C, ..., Z, AA, AB, etc.
+        def get_chain_id(chain_num: int) -> str:
+            """Generate chain ID: A-Z, then AA, AB, AC, ..."""
+            if chain_num < 26:
+                return chr(65 + chain_num)  # A-Z
             else:
-                with open(temp_path, 'w') as f:
-                    for chain in all_chains:
-                        if hasattr(chain, 'to_pdb_string'):
-                            f.write(chain.to_pdb_string())
+                # AA, AB, AC, ...
+                first = chr(65 + (chain_num - 26) // 26)
+                second = chr(65 + (chain_num - 26) % 26)
+                return first + second
+
+        chain_counter = 0
+
+        with open(temp_path, 'w') as outfile:
+            for entity_idx, entity in enumerate(system):
+                if entity.structures and structure_key in entity.structures:
+                    entity_chains = entity.structures[structure_key]
+                    if not isinstance(entity_chains, list):
+                        entity_chains = [entity_chains]
+
+                    for chain_obj in entity_chains:
+                        # Assign new chain ID
+                        new_chain_id = get_chain_id(chain_counter)
+                        chain_to_entity[new_chain_id] = entity_idx
+                        entity_to_pdb_chains[entity_idx].append(new_chain_id)
+
+                        # Write chain to PDB with modified chain ID
+                        if hasattr(chain_obj, 'to_pdb_string'):
+                            pdb_content = chain_obj.to_pdb_string()
+                            modified_content = self._replace_chain_id(
+                                pdb_content, new_chain_id)
+                            outfile.write(modified_content)
+                        elif hasattr(chain_obj, 'to_file'):
+                            # Write to temp file then read and modify
+                            temp_chain_fd, temp_chain_path = tempfile.mkstemp(
+                                suffix='.pdb')
+                            os.close(temp_chain_fd)
+                            try:
+                                chain_obj.to_file(
+                                    temp_chain_path, format="pdb")
+                                with open(temp_chain_path, 'r') as infile:
+                                    pdb_content = infile.read()
+                                    modified_content = self._replace_chain_id(
+                                        pdb_content, new_chain_id)
+                                    outfile.write(modified_content)
+                            finally:
+                                if os.path.exists(temp_chain_path):
+                                    os.unlink(temp_chain_path)
                         else:
                             raise NotImplementedError(
                                 "Cannot write PDB - Structure class missing to_file or to_pdb_string method")
 
-        return temp_path
+                        chain_counter += 1
 
-    def _create_pdb_to_entity_mapping(self, system: System, protein_dict: Dict) -> Dict:
+            # Write END record
+            outfile.write("END\n")
+
+        # Now parse the written PDB to build position mappings
+        pdb_to_entity_mapping = self._build_position_mapping(
+            temp_path, chain_to_entity
+        )
+
+        return temp_path, pdb_to_entity_mapping, entity_to_pdb_chains
+
+    def _build_position_mapping(self, pdb_path: str, chain_to_entity: Dict[str, int]) -> Dict[int, Tuple[int, int]]:
         """
-        Create mapping from PDB residue positions to entity (idx, pos) tuples.
-        This handles cases where PDB chains may be shorter than entity sequences.
+        Build mapping from PDB residue positions to entity positions by parsing the PDB file.
+
+        Args:
+            pdb_path: Path to PDB file
+            chain_to_entity: Mapping of chain_id -> entity_idx
+
+        Returns:
+            Dictionary mapping pdb_position -> (entity_idx, entity_position)
         """
-        mapping = {}
+        pdb_to_entity_mapping = {}
+
+        # Track position within each chain
+        chain_positions = {}  # chain_id -> current position counter
+
+        # Track overall PDB position
+        current_pdb_pos = 0
+        last_chain = None
+        last_resnum = None
+
+        with open(pdb_path, 'r') as f:
+            for line in f:
+                if line.startswith('ATOM') and line[12:16].strip() == 'CA':
+                    chain_id = line[21].strip()
+                    resnum = int(line[22:26].strip())
+
+                    # Initialize chain position counter if needed
+                    if chain_id not in chain_positions:
+                        chain_positions[chain_id] = 0
+
+                    # Check if this is a new residue (not just another atom)
+                    if chain_id != last_chain or resnum != last_resnum:
+                        # Get entity index for this chain
+                        if chain_id in chain_to_entity:
+                            entity_idx = chain_to_entity[chain_id]
+                            entity_pos = chain_positions[chain_id]
+
+                            pdb_to_entity_mapping[current_pdb_pos] = (
+                                entity_idx, entity_pos)
+
+                            chain_positions[chain_id] += 1
+                            current_pdb_pos += 1
+
+                        last_chain = chain_id
+                        last_resnum = resnum
+
+        return pdb_to_entity_mapping
+
+    def _replace_chain_id(self, pdb_content: str, new_chain_id: str) -> str:
+        """Replace chain IDs in PDB content."""
+        lines = []
+        for line in pdb_content.split('\n'):
+            if line.startswith(('ATOM', 'HETATM', 'TER')):
+                # Chain ID is at position 21 (0-indexed: 21)
+                if len(line) > 21:
+                    line = line[:21] + new_chain_id + line[22:]
+            lines.append(line)
+        return '\n'.join(lines)
+
+    def _build_symmetry_from_chains(self, protein_dict: Dict) -> Tuple[List[List[int]], List[List[float]]]:
+        """
+        Build symmetry constraints from entity_to_pdb_chains mapping.
+
+        Args:
+            protein_dict: Parsed PDB dictionary containing chain info
+
+        Returns:
+            Tuple of (symmetry_residues, symmetry_weights)
+        """
+        symmetry_residues = []
+        symmetry_weights = []
+
+        # Get actual chain lengths from parsed PDB
         chain_list = protein_dict['chain_list']
         mask_c = protein_dict['mask_c']
 
-        current_pdb_pos = 0
-        for entity_idx, entity in enumerate(system):
-            if entity.structures:
-                for structure_key, chains in entity.structures.items():
-                    if not isinstance(chains, list):
-                        chains = [chains]
+        # Build chain_id to length mapping
+        chain_lengths = {}
+        for i, chain_id in enumerate(chain_list):
+            chain_length = mask_c[i].sum().item()
+            chain_lengths[chain_id] = chain_length
 
-                    for chain_idx, _ in enumerate(chains):
-                        # Get the actual chain length from PDB
-                        if chain_idx < len(chain_list):
-                            chain_length = mask_c[chain_idx].sum().item()
+        # For each entity with multiple chains (homo-oligomer)
+        for entity_idx, pdb_chain_ids in self.entity_to_pdb_chains.items():
+            if len(pdb_chain_ids) > 1:
+                # Get lengths of all chains for this entity
+                entity_chain_lengths = [chain_lengths.get(
+                    cid, 0) for cid in pdb_chain_ids]
 
-                            # Map each PDB position to entity position
-                            # Assuming chains correspond to same sequence positions
-                            for pos_in_chain in range(chain_length):
-                                pdb_pos = current_pdb_pos + pos_in_chain
-                                mapping[pdb_pos] = (entity_idx, pos_in_chain)
+                # Use minimum length to avoid out-of-bounds
+                min_chain_length = min(
+                    entity_chain_lengths) if entity_chain_lengths else 0
 
-                            current_pdb_pos += chain_length
+                # Calculate starting position for each chain in concatenated sequence
+                chain_start_positions = []
+                cumulative_pos = 0
+                for chain_id in chain_list:
+                    if chain_id in pdb_chain_ids:
+                        chain_start_positions.append(cumulative_pos)
+                    cumulative_pos += chain_lengths.get(chain_id, 0)
 
-        return mapping
+                # Create symmetry groups
+                num_chains = len(pdb_chain_ids)
+                for pos in range(min_chain_length):
+                    residue_group = []
+                    weight_group = []
+
+                    for start_pos in chain_start_positions:
+                        residue_idx = start_pos + pos
+                        residue_group.append(residue_idx)
+                        weight_group.append(1.0 / num_chains)
+
+                    symmetry_residues.append(residue_group)
+                    symmetry_weights.append(weight_group)
+
+        return symmetry_residues, symmetry_weights
 
     def _split_concatenated_sequences(self, concatenated_sequences: List[str],
                                       entity_lengths: List[Tuple[int, int]]) -> Dict[int, List[str]]:
         """
         Split concatenated sequences back into per-entity sequences.
-        Now handles the case where PDB sequence != entity sequence due to missing residues.
+        Handles cases where PDB sequence != entity sequence due to missing residues.
         """
         separated_sequences = {entity_idx: []
                                for entity_idx, _ in entity_lengths}
 
         for concat_seq in concatenated_sequences:
-            # Use the PDB-to-entity mapping to properly split sequences
-            for entity_idx, entity_length in entity_lengths:
-                # Initialize entity sequence with gaps
-                entity_seq = ['X'] * entity_length
+            # Initialize entity sequences with gaps
+            entity_seqs = {entity_idx: ['X'] * length
+                           for entity_idx, length in entity_lengths}
 
-                # Fill in positions that exist in PDB
-                for pdb_pos, aa in enumerate(concat_seq):
-                    if pdb_pos in self.pdb_to_entity_mapping:
-                        mapped_entity_idx, entity_pos = self.pdb_to_entity_mapping[pdb_pos]
-                        if mapped_entity_idx == entity_idx and entity_pos < entity_length:
-                            entity_seq[entity_pos] = aa
+            # Fill in positions that exist in PDB
+            for pdb_pos, aa in enumerate(concat_seq):
+                if pdb_pos in self.pdb_to_entity_mapping:
+                    mapped_entity_idx, entity_pos = self.pdb_to_entity_mapping[pdb_pos]
+                    entity_length = dict(entity_lengths).get(
+                        mapped_entity_idx, 0)
+                    if entity_pos < entity_length:
+                        entity_seqs[mapped_entity_idx][entity_pos] = aa
 
-                separated_sequences[entity_idx].append(''.join(entity_seq))
+            # Add to results
+            for entity_idx, _ in entity_lengths:
+                separated_sequences[entity_idx].append(
+                    ''.join(entity_seqs[entity_idx]))
 
         return separated_sequences
-
-    def _create_chain_mapping(self, system: System) -> Dict[str, str]:
-        """Create mapping from PDB chain IDs to entity names/indices."""
-        chain_to_entity = {}
-
-        for idx, entity in enumerate(system):
-            entity_id = entity.id_ or f'entity_{idx}'
-
-            if entity.structures:
-                for structure_key, chains in entity.structures.items():
-                    if not isinstance(chains, list):
-                        chains = [chains]
-                    for chain in chains:
-                        if hasattr(chain, 'chain_id'):
-                            chain_id = chain.chain_id
-                        elif hasattr(chain, 'get_id'):
-                            chain_id = chain.get_id()
-                        else:
-                            chain_id = getattr(chain, 'id', f'chain_{idx}')
-
-                        chain_to_entity[chain_id] = entity_id
-
-        return chain_to_entity
-
-    def _determine_homooligomer_symmetry(self, system: System, protein_dict: Dict) -> Tuple[List[List[int]], List[List[float]]]:
-        """Determine symmetry constraints for homo-oligomers using ACTUAL PDB chain lengths."""
-        symmetry_residues = []
-        symmetry_weights = []
-
-        # Get chain information from parsed PDB
-        chain_list = protein_dict['chain_list']
-        mask_c = protein_dict['mask_c']
-
-        for entity_idx, entity in enumerate(system):
-            if entity.structures:
-                for structure_key, chains in entity.structures.items():
-                    if not isinstance(chains, list):
-                        chains = [chains]
-
-                    if len(chains) > 1:  # Homo-oligomer
-                        # Get actual chain lengths from PDB
-                        pdb_chain_lengths = []
-
-                        for i in range(len(chain_list)):
-                            chain_length = mask_c[i].sum().item()
-                            pdb_chain_lengths.append(chain_length)
-
-                        # Calculate cumulative positions for each chain
-                        chain_start_positions = [0]
-                        for length in pdb_chain_lengths[:-1]:
-                            chain_start_positions.append(
-                                chain_start_positions[-1] + length)
-
-                        # Use minimum chain length to avoid out-of-bounds
-                        min_chain_length = min(pdb_chain_lengths)
-
-                        # Create symmetry groups based on actual chain positions
-                        for pos in range(min_chain_length):
-                            residue_group = []
-                            weight_group = []
-
-                            for chain_idx, start_pos in enumerate(chain_start_positions):
-                                residue_idx = start_pos + pos
-                                residue_group.append(residue_idx)
-                                weight_group.append(1.0 / len(chains))
-
-                            symmetry_residues.append(residue_group)
-                            symmetry_weights.append(weight_group)
-
-        return symmetry_residues, symmetry_weights
 
     def _create_chain_mask(self, fixed_pos: EntityPosList | None) -> torch.Tensor:
         """
