@@ -1,37 +1,47 @@
-from os import PathLike
-from typing import Self, Tuple, Sequence, List
+import numpy as np
+import torch
+import tempfile
+import os
+from typing import List, Dict, Sequence, Callable, Tuple, Optional, Self
 from pathlib import Path
 
-import numpy as np
-import pandas as pd
-from loguru import logger
-import torch
-
 from protdesign.model import (
-    BaseModel, Scorer, Generator, RequiredResources, MutationScorer, ConditionalMutationScorer
+    BaseModel, Scorer, Generator, RequiredResources
 )
-from protdesign.entity import System, SystemInstance, EntityInstance, EntityPosList, Mutant
-from protdesign.utils import model_param_context
+from protdesign.entity import System, SystemInstance, EntityInstance
+from protdesign.entity import EntityPosList
+from protdesign.utils import ensure_sequence
 from protdesign.types import DeviceType, StatusCallback, BatchSize
-from protdesign.samplers.gibbs import GibbsSampler, ScanOrder, InitStrategy, TemperatureSchedule
 
-try:
-    from transformers import EsmForMaskedLM, AutoTokenizer  # noqa
-    IMPORT_AVAILABLE = True
-except ImportError:
-    IMPORT_AVAILABLE = False
+# Import the LigandMPNN modules
+from protdesign.models.ligandmpnn.data_utils import (
+    featurize,
+    parse_PDB,
+    restype_str_to_int,
+    restype_int_to_str,
+    get_score,
+    get_seq_rec
+)
+from protdesign.models.ligandmpnn.model_utils import ProteinMPNN
 
 
-class ESM2(BaseModel, Scorer, MutationScorer, ConditionalMutationScorer, Generator):
+class LigandMPNNWrapper(BaseModel, Scorer, Generator):
     """
-    Wrapper class around ESM2 model
+    Wrapper for LigandMPNN that works with System objects.
+
+    Usage:
+        wrapper = LigandMPNNWrapper()
+        wrapper.build(system)
+        instances = wrapper.generate(num_designs=10, temperature=0.2)
+        scores = wrapper.score(instances)
     """
-    available = IMPORT_AVAILABLE
-    name: str = "ESM2"
+
+    available = True
+    name: str = "LigandMPNN"
 
     # core properties
     requires_target: bool = True
-    requires_fixed_length: bool = True
+    requires_fixed_length: bool = False
     handles_deletions: bool = False
     handles_insertions: bool = False
     requires_gpu: bool = False
@@ -43,67 +53,60 @@ class ESM2(BaseModel, Scorer, MutationScorer, ConditionalMutationScorer, Generat
     requires_heavy_build: bool = False
     requires_seqs: bool = False
     requires_msa: bool = False
-    requires_3d: bool = False
+    requires_3d: bool = True
 
-    def __init__(
-        self,
-        model_name: str | None = None,
-        model_dir_path: str | PathLike | None = None,
-        batch_size: BatchSize = 64,
-        keep_model_after_build: bool = False,
-        device: DeviceType = "cpu",
-        # GibbsSampler hyperparameters
-        num_sweeps: int = 1000,
-        init_strategy: InitStrategy = "system",
-        scan_order: ScanOrder = "random",
-        temperature_schedule: TemperatureSchedule | None = None
-    ):
-        if not self.available:
-            raise ValueError(
-                "transformers package could not be imported. Is it installed already?"
-            )
+    def __init__(self,
+                 model_type: str = "ligand_mpnn",
+                 checkpoint_path: str | None = None,
+                 device: DeviceType | None = None,
+                 batch_size: BatchSize = 1,
+                 seed: int | None = None,
+                 use_ligand_context: bool = True,
+                 keep_model_after_build: bool = False):
+        """
+        Initialize the LigandMPNN wrapper.
 
-        # Validate model specification parameters
-        if (model_name is None and model_dir_path is None) or (model_name is not None and model_dir_path is not None):
-            raise ValueError(
-                "Must specify exactly one of model_name or model_file_path, but not both"
-            )
-
-        self.model_name = model_name
-        self.model_dir_path = Path(
-            model_dir_path
-        ) if model_dir_path is not None else None
-        self.keep_model_after_build = keep_model_after_build
-        self.keep_model_after_pred = True
-        self.device = device
-
-        # Define maximum sequence length for ESM2 models (1024 tokens - 2 for special tokens)
-        self.max_seq_length = 1022
-
-        self._system = None
-        self.model = None
-        self.tokenizer = None  # Changed from alphabet to tokenizer
-
+        Args:
+            model_type: Type of model ("ligand_mpnn", "protein_mpnn", "soluble_mpnn", etc.)
+            checkpoint_path: Path to model checkpoint
+            device: Device to run on ("cuda" or "cpu")
+            batch_size: Batch size for sequence generation
+            seed: Random seed for sequence generation
+            use_ligand_context: Whether to use ligand context
+            keep_model_after_build: Whether to keep model loaded after build
+        """
+        self.model_type = model_type
+        self.device = device or (
+            "cuda" if torch.cuda.is_available() else "cpu")
         self.batch_size = batch_size
+        self.seed = seed
+        self.use_ligand_context = use_ligand_context
+        self.keep_model_after_build = keep_model_after_build
 
-        # Store GibbsSampler hyperparameters
-        self.num_sweeps = num_sweeps
-        self.init_strategy = init_strategy
-        self.scan_order = scan_order
-        self.temperature_schedule = temperature_schedule
+        # Set default checkpoint paths
+        if checkpoint_path is None:
+            default_paths = {
+                "ligand_mpnn": "./model_params/ligandmpnn_v_32_010_25.pt",
+                "protein_mpnn": "./model_params/proteinmpnn_v_48_020.pt",
+                "soluble_mpnn": "./model_params/solublempnn_v_48_020.pt",
+            }
+            checkpoint_path = default_paths.get(
+                model_type, default_paths["ligand_mpnn"])
 
-        if self.batch_size != "auto" and self.batch_size < 1:
-            raise ValueError(
-                "decoder_batch_size must be at least 1 or 'auto'"
-            )
+        self.checkpoint_path = checkpoint_path
+        self.model = None
 
-        if self.batch_size == "auto":
-            raise NotImplementedError(
-                "Automatic batch_size not yet implemented"
-            )
+        # State that gets set during build()
+        self._system = None
+        self.feature_dict = None
+        self.entity_lengths = None
+        self.chain_mapping = None
+        self.symmetry_residues = None
+        self.symmetry_weights = None
+        self.native_seq = None
+        self.pdb_path = None
 
-        self.token_ids = None
-        self.encoding = None
+        self._load_model()
 
     @property
     def ready(self):
@@ -118,17 +121,12 @@ class ESM2(BaseModel, Scorer, MutationScorer, ConditionalMutationScorer, Generat
         if data is not None:
             return False, "Model does not support data parameter (must be None)"
 
-        if len(system) != 1 or system[0].type_ != "protein":
-            return False, "Can only handle single-component protein system"
-
-        target = system[0]
-        if not target.defined_sequence():
-            return False, "Entity must have defined rep sequence"
-
-        # Add check for sequence length
-        max_seq_length = 1022  # 1024 - 2 for special tokens
-        if len(target.rep) > max_seq_length:
-            return False, f"Sequence length ({len(target.rep)}) exceeds maximum allowed ({max_seq_length})"
+        # Check that all entities are proteins with structures
+        for entity in system:
+            if entity.type_ != "protein":
+                return False, "Can only handle protein entities"
+            if not entity.structures:
+                return False, "All entities must have 3D structures"
 
         return True, ""
 
@@ -143,83 +141,106 @@ class ESM2(BaseModel, Scorer, MutationScorer, ConditionalMutationScorer, Generat
         raise NotImplementedError(
             "Resource estimation not yet implemented"
         )
-        # return RequiredResources(
-        #     min_gpu_cores=1,
-        #     min_gpu_memory_per_core=16000,
-        #     min_cpu_cores=1,
-        #     min_cpu_memory_per_core=16000,
-        #     max_batch_size=512,
-        #     time=1,
-        # )
 
     def _load_model(self):
-        if self.model is not None:
-            return
+        """Load the model from checkpoint"""
+        if not os.path.exists(self.checkpoint_path):
+            raise FileNotFoundError(
+                f"Checkpoint not found: {self.checkpoint_path}")
 
-        if self.model_name is not None:
-            # Load from HuggingFace hub
-            try:
-                # For remote loading from HuggingFace
-                self.model = EsmForMaskedLM.from_pretrained(
-                    f"facebook/{self.model_name}"
-                ).to(self.device)
-                self.tokenizer = AutoTokenizer.from_pretrained(
-                    f"facebook/{self.model_name}"
-                )
-            except Exception as e:
-                logger.error(f"Error loading model from HuggingFace: {e}")
-                raise ValueError(
-                    f"Failed to load model {self.model_name} from HuggingFace: {e}"
-                )
-        elif self.model_dir_path is not None:
-            # Load from local file path
-            try:
-                # For local loading from a directory
-                self.model = EsmForMaskedLM.from_pretrained(
-                    self.model_dir_path
-                ).to(self.device)
-                self.tokenizer = AutoTokenizer.from_pretrained(
-                    self.model_dir_path
-                )
-            except Exception as e:
-                logger.error(f"Error loading model from local path: {e}")
+        # Set random seed if provided
+        if self.seed is not None:
+            torch.manual_seed(self.seed)
+            np.random.seed(self.seed)
 
-                raise ValueError(
-                    f"Failed to load model from {self.model_dir_path}: {e}"
-                )
+        checkpoint = torch.load(self.checkpoint_path, map_location=self.device)
 
+        # Extract model parameters
+        if self.model_type == "ligand_mpnn":
+            atom_context_num = checkpoint.get("atom_context_num", 25)
+            k_neighbors = checkpoint.get("num_edges", 32)
+        else:
+            atom_context_num = 1
+            k_neighbors = checkpoint.get("num_edges", 48)
+
+        # Initialize model
+        self.model = ProteinMPNN(
+            node_features=128,
+            edge_features=128,
+            hidden_dim=128,
+            num_encoder_layers=3,
+            num_decoder_layers=3,
+            k_neighbors=k_neighbors,
+            device=self.device,
+            atom_context_num=atom_context_num,
+            model_type=self.model_type,
+            ligand_mpnn_use_side_chain_context=False,
+        )
+
+        self.model.load_state_dict(checkpoint["model_state_dict"])
+        self.model.to(self.device)
         self.model.eval()
 
-    def _release_cache(self):
-        if self.device == "cuda":
-            torch.cuda.empty_cache()
-        elif self.device == "mps":
-            torch.mps.empty_cache()
+    def build(self,
+              system: System,
+              data: None = None,
+              ligand_cutoff: float = 8.0,
+              status_callback: StatusCallback | None = None) -> Self:
+        """
+        Build/prepare the system for sequence generation.
 
-    def _delete_model(self):
-        self.model = None
-        self.tokenizer = None  # Changed from alphabet to tokenizer
+        Args:
+            system: System object containing protein entities and structures
+            data: Not used, must be None
+            ligand_cutoff: Distance cutoff for ligand context
+            status_callback: Optional callback for status updates
 
-        self._release_cache()
-
-    def build(
-        self,
-        system: System,
-        data: None = None,
-        status_callback: StatusCallback | None = None
-    ) -> Self:
+        Returns:
+            self for method chaining
+        """
         self.can_model_or_raise(system, data)
         self._system = system
 
-        # Additional check for sequence length
-        target = system[0]
-        if len(target.rep) > self.max_seq_length:
-            raise ValueError(
-                f"Sequence length ({len(target.rep)}) exceeds maximum allowed by ESM2 ({self.max_seq_length})"
-            )
+        # Get entity sequence lengths
+        self.entity_lengths = [(idx, len(entity.rep) if entity.rep is not None else 0)
+                               for idx, entity in enumerate(system)]
 
-        self.encoding = None
-        self.token_ids = None
+        # Convert system to PDB file
+        self.pdb_path = self._system_to_pdb_file(system)
+
+        # Parse PDB with LigandMPNN
+        protein_dict, backbone, other_atoms, icodes, _ = parse_PDB(
+            self.pdb_path,
+            device=self.device,
+            chains=[],
+            parse_all_atoms=True,
+            parse_atoms_with_zero_occupancy=False,
+        )
+
+        # Create mappings
+        self.chain_mapping = self._create_chain_mapping(system)
+
+        # Determine homo-oligomer symmetry if applicable
+        self.symmetry_residues, self.symmetry_weights = self._determine_homooligomer_symmetry(
+            system)
+
+        # Set up chain mask (which residues to design)
+        chain_mask = torch.ones_like(protein_dict["mask"], dtype=torch.float32)
+        protein_dict["chain_mask"] = chain_mask
+
+        # Featurize the protein
+        self.feature_dict = featurize(
+            protein_dict,
+            cutoff_for_score=ligand_cutoff,
+            use_atom_context=self.use_ligand_context,
+            number_of_ligand_atoms=getattr(self.model, 'atom_context_num', 25),
+            model_type=self.model_type,
+        )
+
+        # Store native sequence
+        self.native_seq = "".join([
+            restype_int_to_str[aa] for aa in self.feature_dict["S"][0].cpu().numpy()
+        ])
 
         return self
 
@@ -227,623 +248,429 @@ class ESM2(BaseModel, Scorer, MutationScorer, ConditionalMutationScorer, Generat
         self,
         instance: SystemInstance | None = None,
     ) -> List[Tuple[int, int]]:
+        """Get all designable positions in the system."""
         self.ready_or_raise()
-        target = self.system[0]
-        return [(0, pos) for pos, _ in enumerate(target.rep, start=target.first_index)]
+        positions = []
+        for entity_idx, entity in enumerate(self.system):
+            if entity.rep is not None:
+                for pos in range(len(entity.rep)):
+                    positions.append((entity_idx, pos))
+        return positions
 
-    def _validate_instances(
-        self,
-        instances: Sequence[SystemInstance],
-    ) -> None:
-        # Validate all instances in a single loop
-        for instance in instances:
-            # First validate the instance with system validation
-            self.system.valid_instance(
-                instance,
-                validate_reps=True,
-                fixed_length=True,
-                allow_deletions=False,
-                raise_invalid=True,
-            )
+    def _system_to_pdb_file(self, system: System) -> str:
+        """Convert a System object to a temporary PDB file."""
+        temp_fd, temp_path = tempfile.mkstemp(suffix='.pdb')
+        os.close(temp_fd)
 
-            # Now that we know the instance is valid
-            seq = instance[0].rep
-            seq_len = len(seq)
+        structure_keys = set()
+        for entity in system:
+            structure_keys.update(entity.structures.keys()
+                                  ) if entity.structures else None
 
-            # Check sequence length
-            if seq_len > self.max_seq_length:
-                raise ValueError(
-                    f"Sequence length ({seq_len}) exceeds maximum allowed by ESM2 ({self.max_seq_length})"
-                )
+        if len(structure_keys) > 1:
+            raise NotImplementedError(
+                "Multi-state design not currently supported")
+
+        structure_key = list(structure_keys)[0] if structure_keys else None
+
+        # Collect all chains from all entities for this structure
+        all_chains = []
+        for entity in system:
+            if entity.structures and structure_key in entity.structures:
+                entity_chains = entity.structures[structure_key]
+                if not isinstance(entity_chains, list):
+                    entity_chains = [entity_chains]
+                all_chains.extend(entity_chains)
+                entity_id = entity.id_ or f'entity_{len(all_chains)}'
+                print(
+                    f"Adding chains from entity {entity_id}: {len(entity_chains)} chains")
+
+        print(f"Total chains to write: {len(all_chains)}")
+
+        # Write combined structure to PDB file
+        if all_chains:
+            if hasattr(all_chains[0], 'to_file') and len(all_chains) == 1:
+                all_chains[0].to_file(temp_path, format="pdb")
+            elif hasattr(all_chains[0], 'to_file'):
+                try:
+                    combined_structure = all_chains[0]
+                    for chain in all_chains[1:]:
+                        if hasattr(combined_structure, 'add_chain'):
+                            combined_structure.add_chain(chain)
+                        else:
+                            raise NotImplementedError(
+                                "Need to implement chain combination")
+                    combined_structure.to_file(temp_path, format="pdb")
+                except (AttributeError, NotImplementedError):
+                    temp_files = []
+                    for i, chain in enumerate(all_chains):
+                        temp_fd, temp_chain_path = tempfile.mkstemp(
+                            suffix=f'_chain{i}.pdb')
+                        os.close(temp_fd)
+                        chain.to_file(temp_chain_path, format="pdb")
+                        temp_files.append(temp_chain_path)
+
+                    with open(temp_path, 'w') as outfile:
+                        for temp_file in temp_files:
+                            with open(temp_file, 'r') as infile:
+                                for line in infile:
+                                    if line.startswith(('ATOM', 'HETATM', 'TER', 'END')):
+                                        outfile.write(line)
+
+                    for temp_file in temp_files:
+                        if os.path.exists(temp_file):
+                            os.unlink(temp_file)
+            else:
+                with open(temp_path, 'w') as f:
+                    for chain in all_chains:
+                        if hasattr(chain, 'to_pdb_string'):
+                            f.write(chain.to_pdb_string())
+                        else:
+                            raise NotImplementedError(
+                                "Cannot write PDB - Structure class missing to_file or to_pdb_string method")
+
+        print(temp_path)
+        return temp_path
+
+    def _split_concatenated_sequences(self, concatenated_sequences: List[str],
+                                      entity_lengths: List[Tuple[int, int]]) -> Dict[int, List[str]]:
+        """Split concatenated sequences back into per-entity sequences."""
+        separated_sequences = {entity_idx: []
+                               for entity_idx, _ in entity_lengths}
+
+        for concat_seq in concatenated_sequences:
+            start_pos = 0
+            for entity_idx, length in entity_lengths:
+                entity_seq = concat_seq[start_pos:start_pos + length]
+                separated_sequences[entity_idx].append(entity_seq)
+                start_pos += length
+
+        return separated_sequences
+
+    def _create_chain_mapping(self, system: System) -> Dict[str, str]:
+        """Create mapping from PDB chain IDs to entity names/indices."""
+        chain_to_entity = {}
+
+        for idx, entity in enumerate(system):
+            entity_id = entity.id_ or f'entity_{idx}'
+
+            if entity.structures:
+                for structure_key, chains in entity.structures.items():
+                    if not isinstance(chains, list):
+                        chains = [chains]
+                    for chain in chains:
+                        if hasattr(chain, 'chain_id'):
+                            chain_id = chain.chain_id
+                        elif hasattr(chain, 'get_id'):
+                            chain_id = chain.get_id()
+                        else:
+                            chain_id = getattr(chain, 'id', f'chain_{idx}')
+
+                        chain_to_entity[chain_id] = entity_id
+                        print(f"Mapped chain {chain_id} to entity {entity_id}")
+
+        return chain_to_entity
+
+    def _determine_homooligomer_symmetry(self, system: System) -> Tuple[List[List[int]], List[List[float]]]:
+        """Determine symmetry constraints for homo-oligomers."""
+        symmetry_residues = []
+        symmetry_weights = []
+
+        for entity in system:
+            if entity.structures:
+                for structure_key, chains in entity.structures.items():
+                    if not isinstance(chains, list):
+                        chains = [chains]
+
+                    if len(chains) > 1:  # Homo-oligomer
+                        seq_length = len(
+                            entity.rep) if entity.rep is not None else 0
+                        for pos in range(seq_length):
+                            residue_group = []
+                            weight_group = []
+
+                            for i, _ in enumerate(chains):
+                                residue_group.append(pos + i * seq_length)
+                                weight_group.append(1.0 / len(chains))
+
+                            symmetry_residues.append(residue_group)
+                            symmetry_weights.append(weight_group)
+
+        return symmetry_residues, symmetry_weights
+
+    def _create_chain_mask(self, fixed_pos: EntityPosList | None) -> torch.Tensor:
+        """
+        Create chain mask from fixed positions.
+
+        Args:
+            fixed_pos: Mapping of entity_idx -> list of fixed positions
+
+        Returns:
+            Chain mask tensor (1 = design, 0 = fixed)
+        """
+        chain_mask = torch.ones_like(
+            self.feature_dict["mask"], dtype=torch.float32)
+
+        if fixed_pos is not None:
+            # Start position for each entity in the concatenated sequence
+            entity_starts = {}
+            current_pos = 0
+            for idx, (entity_id, length) in enumerate(self.entity_lengths):
+                entity_starts[idx] = current_pos
+                current_pos += length
+
+            # Set fixed positions to 0
+            for entity_idx, positions in fixed_pos.items():
+                start_pos = entity_starts[entity_idx]
+                for pos in positions:
+                    chain_mask[0, start_pos + pos] = 0.0
+
+        return chain_mask
+
+    def _create_bias_tensor(self, amino_acid_bias: Dict[str, float]) -> torch.Tensor:
+        """Create bias tensor from amino acid bias dictionary."""
+        bias_tensor = torch.zeros(
+            [21], device=self.device, dtype=torch.float32)
+        for aa, bias in amino_acid_bias.items():
+            if aa in restype_str_to_int:
+                bias_tensor[restype_str_to_int[aa]] = bias
+        return bias_tensor
 
     def generate(
         self,
         num_designs: int,
         entities: Sequence[int] | None = None,
         fixed_pos: EntityPosList | None = None,
-        temperature: float = 1.0,
+        temperature: float = 0.1,
+        batch_size: int | None = None,
+        seed: Optional[int] = None,
+        amino_acid_bias: Optional[Dict[str, float]] = None,
+        omit_amino_acids: Optional[str] = None,
+        use_ligand_context: bool = True,
         deletions: bool = False,
-        status_callback: StatusCallback | None = None,
+        status_callback: StatusCallback | None = None
     ) -> List[SystemInstance]:
         """
-        Generate protein sequences using the ESM2 model with the GibbsSampler
+        Generate new sequences for the built structure and optionally score them.
 
-        Parameters
-        ----------
-        num_designs
-            Number of protein sequences to generate
-        entities
-            Indices of entities to redesign (default: [0])
-        fixed_pos
-            Positions to keep fixed during design
-        temperature
-            Initial temperature for sampling
-        deletions
-            Whether to allow deletions
-        status_callback
-            Optional callback function for progress updates
+        Args:
+            num_designs: Number of designs to generate
+            entities: Which entities to design (None = all)
+            fixed_pos: Mapping of entity_idx -> list of fixed positions
+            temperature: Sampling temperature
+            batch_size: Batch size for generation
+            seed: Random seed
+            amino_acid_bias: Global amino acid biases
+            omit_amino_acids: Amino acids to omit globally
+            use_ligand_context: Whether to use ligand context
+            deletions: Not supported, must be False
+            status_callback: Optional callback for status updates
 
-        Returns
-        -------
-        List[SystemInstance]
-            Generated protein sequence instances
+        Returns:
+            List of SystemInstance objects with optional scores
         """
+        # 1. Check model is ready
         self.ready_or_raise()
 
-        # Add validation for deletions parameter
         if deletions:
-            raise ValueError(
-                "ESM2 model does not support deletions (gaps)"
+            raise ValueError("LigandMPNN does not support deletions")
+
+        # Use instance batch_size if not provided
+        if batch_size is None:
+            batch_size = self.batch_size
+
+        # 2. Set random seed
+        if seed is not None:
+            torch.manual_seed(seed)
+            np.random.seed(seed)
+
+        # 3. Validate entity selection
+        if entities is not None:
+            entities = ensure_sequence(entities)
+            # Validate entities exist in system
+            max_entity = len(self.system) - 1
+            for entity_idx in entities:
+                if entity_idx > max_entity:
+                    raise ValueError(
+                        f"Entity index {entity_idx} out of range (max: {max_entity})")
+        else:
+            entities = list(range(len(self.system)))
+
+        # 4. Process fixed_pos into chain_mask
+        chain_mask = self._create_chain_mask(fixed_pos)
+
+        # 5. Update feature_dict with generation parameters
+        feature_dict_copy = self.feature_dict.copy()
+        feature_dict_copy["chain_mask"] = chain_mask
+        feature_dict_copy["batch_size"] = batch_size
+        feature_dict_copy["temperature"] = temperature
+        feature_dict_copy["symmetry_residues"] = self.symmetry_residues or [[]]
+        feature_dict_copy["symmetry_weights"] = self.symmetry_weights or [[]]
+
+        # 6. Apply amino acid biases (always set bias tensor)
+        B, L, _, _ = feature_dict_copy["X"].shape
+        if amino_acid_bias:
+            bias_tensor = self._create_bias_tensor(amino_acid_bias)
+        else:
+            bias_tensor = torch.zeros(
+                [21], device=self.device, dtype=torch.float32)
+        feature_dict_copy["bias"] = bias_tensor[None, None, :].repeat(1, L, 1)
+
+        # 7. Generate sequences using the model
+        L = feature_dict_copy["X"].shape[1]
+        generated_sequences = []
+
+        with torch.no_grad():
+            num_batches = (num_designs + batch_size - 1) // batch_size
+            for batch_idx in range(num_batches):
+                if status_callback:
+                    status_callback(
+                        f"Generating batch {batch_idx + 1}/{num_batches}")
+
+                feature_dict_copy["randn"] = torch.randn(
+                    [batch_size, L], device=self.device)
+                output_dict = self.model.sample(feature_dict_copy)
+                generated_sequences.append(output_dict["S"])
+
+        S_stack = torch.cat(generated_sequences, 0)[:num_designs]
+
+        # 8. Convert to sequences and split by entity
+        concatenated_sequences = [
+            "".join([restype_int_to_str[aa]
+                    for aa in S_stack[i].cpu().numpy()])
+            for i in range(S_stack.shape[0])
+        ]
+
+        separated_sequences = self._split_concatenated_sequences(
+            concatenated_sequences, self.entity_lengths
+        )
+
+        # 9. Create SystemInstance objects
+        system_instances = []
+        for design_idx in range(num_designs):
+            entity_instances = []
+
+            # Calculate individual entity recoveries
+            for entity_idx, (entity_id, length) in enumerate(self.entity_lengths):
+                generated_seq = separated_sequences[entity_idx][design_idx]
+                native_seq = self.native_seq[sum(length for (_, length) in self.entity_lengths[:entity_idx]):sum(
+                    length for (_, length) in self.entity_lengths[:entity_idx+1])]
+
+                # Calculate recovery
+                matches = sum(1 for a, b in zip(
+                    native_seq, generated_seq) if a == b)
+                recovery = matches / len(native_seq)
+
+                # Create EntityInstance
+                # Ensure rep is a string, not a numpy array
+                entity_instance = EntityInstance(
+                    rep=''.join(generated_seq) if hasattr(
+                        generated_seq, 'tolist') else generated_seq
+                )
+
+                entity_instances.append(entity_instance)
+
+            # Calculate overall recovery
+            overall_matches = sum(1 for a, b in zip(self.native_seq, "".join(
+                str(inst.rep) for inst in entity_instances)) if a == b)
+            overall_recovery = overall_matches / len(self.native_seq)
+
+            # Create SystemInstance
+            system_instance = SystemInstance(
+                entity_instances=entity_instances,
+                score=None,
+                confidence=None,
+                metadata={
+                    'design_id': design_idx,
+                    'overall_recovery': overall_recovery,
+                    'log_probability': None,
+                    'sampling_probabilities': None
+                }
             )
 
-        entities = entities if entities is not None else [0]
-        if len(entities) != 1 or entities[0] != 0:
-            raise ValueError(
-                "Can only design single entity (entities = [0] | None)"
-            )
+            system_instances.append(system_instance)
 
-        # Adjust num_designs to be a multiple of batch_size
-        if rem := num_designs % self.batch_size:
-            num_designs_adj = num_designs + (self.batch_size - rem)
-            num_designs = num_designs_adj
+        # 10. Score the generated instances
+        scores = self.score(system_instances, status_callback=status_callback)
 
-        with model_param_context(self._load_model, self._delete_model, self.keep_model_after_pred):
-            logger.info(
-                f"Generating {num_designs} designs with ESM2 using GibbsSampler"
-            )
+        # 11. Attach scores to instances
+        for instance, raw_score in zip(system_instances, scores):
+            instance.score = raw_score
+            instance.metadata['log_probability'] = raw_score
 
-            # Create a GibbsSampler using the configured hyperparameters
-            sampler = GibbsSampler(
-                scorers=[self],
-                weights=None,
-                num_sweeps=self.num_sweeps,
-                init_strategy=self.init_strategy,
-                scan_order=self.scan_order,
-                temperature_schedule=self.temperature_schedule,
-                require_strict_pos=True,
-                record_full_chain=False
-            )
-
-            # Generate designs
-            instances = sampler.generate(
-                num_designs=num_designs,
-                entities=entities,
-                fixed_pos=fixed_pos,
-                temperature=temperature,
-                deletions=deletions,  # This will now be False because of the validation
-                status_callback=status_callback
-            )
-
-        # Score designs relative to reference
-        target = self.system[0]
-        ref_instance = SystemInstance(EntityInstance(rep="".join(target.rep)))
-        all_instances = [ref_instance] + instances
-
-        logger.info(f"Scoring {len(instances)} generated designs")
-        scores = self.score(all_instances)
-        ref_score = scores[0]
-
-        # Attach normalized scores to instances
-        for i, instance in enumerate(instances):
-            instance.score = (scores[i+1] - ref_score)
-
-        return instances
+        return system_instances
 
     def score(
         self,
         instances: Sequence[SystemInstance],
         status_callback: StatusCallback | None = None
-    ) -> np.ndarray[tuple[int], np.dtype[float]]:
-        self.ready_or_raise()
-        self._validate_instances(instances)
+    ) -> np.ndarray:
+        """
+        Score sequences against the built structure.
 
-        # Convert any sequence arrays to strings
+        Args:
+            instances: Sequence of SystemInstance objects to score
+            status_callback: Optional callback for status updates
+
+        Returns:
+            Numpy array of scores (log probabilities)
+        """
+        # 1. Check model is ready
+        self.ready_or_raise()
+
+        # 2. Extract sequences from instances
         sequences = []
         for instance in instances:
-            seq = instance[0].rep
-            seq = "".join(seq)
-            sequences.append(seq)
+            # Ensure each instance's rep is converted to a string
+            concat_seq = "".join([
+                ''.join(inst.rep) if hasattr(
+                    inst.rep, 'tolist') else str(inst.rep)
+                for inst in instance
+            ])
+            sequences.append(concat_seq)
 
-        with model_param_context(self._load_model, self._delete_model, self.keep_model_after_pred):
-            scores = []
+        # 3. Score each sequence
+        scores = []
+        with torch.no_grad():
+            for seq_idx, seq in enumerate(sequences):
+                if status_callback:
+                    status_callback(
+                        f"Scoring sequence {seq_idx + 1}/{len(sequences)}")
 
-            # Process in batches
-            for batch_start in range(0, len(sequences), self.batch_size):
-                batch_end = min(
-                    batch_start + self.batch_size, len(sequences)
+                # Convert sequence to tensor
+                S_tensor = torch.tensor(
+                    [restype_str_to_int.get(aa, 20) for aa in seq],
+                    device=self.device,
+                    dtype=torch.int64
+                )[None, :]
+
+                # Create feature dict for this sequence
+                feature_dict_copy = self.feature_dict.copy()
+                feature_dict_copy["S"] = S_tensor
+                feature_dict_copy["batch_size"] = 1
+                feature_dict_copy["randn"] = torch.randn(
+                    [1, len(seq)], device=self.device)
+                feature_dict_copy["symmetry_residues"] = [[]]
+                feature_dict_copy["symmetry_weights"] = [[]]
+
+                # Score the sequence
+                output_dict = self.model.score(
+                    feature_dict_copy, use_sequence=True)
+
+                # Calculate loss (negative log probability)
+                loss, _ = get_score(
+                    output_dict["S"],
+                    output_dict["log_probs"],
+                    self.feature_dict["mask"][:1]
                 )
-                batch_seqs = sequences[batch_start:batch_end]
 
-                # Prepare batch data with tokenizer
-                inputs = self.tokenizer(
-                    batch_seqs, return_tensors="pt", padding=True
-                ).to(self.device)
+                # Convert to positive log likelihood
+                scores.append(-loss.item())
 
-                # Compute log-likelihoods
-                with torch.no_grad():
-                    outputs = self.model(**inputs)
-                    logits = outputs.logits
-
-                    # Calculate log-likelihood for each sequence
-                    for i, seq in enumerate(batch_seqs):
-                        # Get sequence length (excluding padding)
-                        # -2 for special tokens
-                        seq_len = len(self.tokenizer.encode(seq)) - 2
-
-                        # Extract logits for the actual sequence (excluding padding and the last token)
-                        # Skip the first special token
-                        seq_logits = logits[i, 1:seq_len+1]
-
-                        # Get target tokens (shifted by one position)
-                        # +2 to include one more token as target
-                        target_tokens = inputs.input_ids[i, 2:seq_len+2]
-
-                        # Calculate log probabilities
-                        token_probs = torch.log_softmax(seq_logits, dim=-1)
-
-                        # Gather log probs for the target tokens
-                        seq_log_probs = torch.gather(
-                            token_probs,
-                            dim=1,
-                            index=target_tokens.unsqueeze(1)
-                        ).squeeze(1)
-
-                        # Sum log probs to get sequence log likelihood
-                        seq_log_likelihood = seq_log_probs.sum().item()
-
-                        scores.append(seq_log_likelihood)
-
+        # 4. Return as numpy array
         return np.array(scores)
 
-    def single_mutation_scan(
-        self,
-        instance: SystemInstance,
-        entity: int | None = None,
-        positions: Sequence[int] | None = None,
-        status_callback: StatusCallback | None = None
-    ) -> pd.DataFrame:
-        """
-        Perform a single mutation scan for the given instance using the Masked marginal probability approach
-        """
-        self.ready_or_raise()
-        self._validate_instances([instance])
-
-        if positions is not None and entity is None:
-            raise ValueError(
-                "Parameter entity must be explicitly specified if using parameter positions"
-            )
-
-        entity = 0 if entity is None else entity
-        if entity != 0:
-            raise ValueError("Model can only handle one single entity")
-
-        # Get sequence and convert to string if needed
-        target = self.system[0]
-        instance_seq = instance[0].rep
-        instance_seq = "".join(instance_seq)
-
-        # Validate positions
-        if positions is not None:
-            self.valid_positions(positions, entities=0, raise_invalid=True)
-        else:
-            positions = list(
-                range(target.first_index, target.first_index + len(target.rep))
-            )
-
-        with model_param_context(self._load_model, self._delete_model, self.keep_model_after_pred):
-            mutation_effects = []
-
-            # For each position to scan
-            for pos in positions:
-                pos_idx = pos - target.first_index
-                wt_aa = instance_seq[pos_idx]
-
-                # Adjust for tokenizer offsets (assuming 1-to-1 mapping + 1 for start token)
-                token_idx = pos_idx + 1
-
-                # Tokenize and create masked input
-                inputs = self.tokenizer(
-                    instance_seq, return_tensors="pt"
-                ).to(self.device)
-                masked_inputs = inputs.copy()
-
-                # Mask the position we want to predict
-                # Get mask token id from tokenizer
-                mask_token_id = self.tokenizer.mask_token_id
-                masked_inputs['input_ids'][0, token_idx] = mask_token_id
-
-                # Forward pass with masked input
-                with torch.no_grad():
-                    outputs = self.model(**masked_inputs)
-                    masked_logits = outputs.logits[0]
-
-                    # Convert logits to log probabilities for the masked position
-                    pos_log_probs = torch.log_softmax(
-                        masked_logits[token_idx], dim=-1
-                    )
-
-                    # Score each possible substitution
-                    mut_scores = {}
-                    for aa in target.alphabet(include_gap=False):
-                        if aa == '-':  # Skip gap character
-                            continue
-
-                        # If same as wildtype, effect is 0
-                        if aa == wt_aa:
-                            mut_scores[aa] = 0.0
-                            continue
-
-                        # Get the token index for this amino acid
-                        aa_token = self.tokenizer.convert_tokens_to_ids(aa)
-                        wt_token = self.tokenizer.convert_tokens_to_ids(wt_aa)
-
-                        # For masked marginal probability, calculate:
-                        # log(p(mut_aa | masked_context)) - log(p(wt_aa | masked_context))
-                        score_diff = (pos_log_probs[aa_token].item() -
-                                      pos_log_probs[wt_token].item())
-
-                        mut_scores[aa] = score_diff
-
-                    # Store results for this position
-                    mutation_effects.append({
-                        'pos': pos,
-                        'ref': wt_aa,
-                        **mut_scores
-                    })
-
-                # Update status callback if provided
-                if status_callback:
-                    progress = (len(mutation_effects) / len(positions)) * 100
-                    status_callback(
-                        "running", progress, f"Processing position {pos}: {progress:.1f}% complete"
-                    )
-
-        # Convert to dataframe with proper index format
-        df = pd.DataFrame(mutation_effects)
-        df = df.set_index(['pos', 'ref'])
-        df = pd.concat({entity: df}, names=["entity"])
-
-        return df
-
-    def score_mutants(
-        self,
-        instance: SystemInstance,
-        mutants: Sequence[Mutant],
-        status_callback: StatusCallback | None = None
-    ) -> np.ndarray[tuple[int], np.dtype[float]]:
-        self.ready_or_raise()
-        self._validate_instances([instance])
-        self.system.valid_mutants(
-            instance, mutants, deletions=False, insertions=False, raise_invalid=True
-        )
-
-        # Get instance sequence
-        target = self.system[0]
-        instance_seq = instance[0].rep
-        instance_seq = "".join(instance_seq)
-
-        with model_param_context(self._load_model, self._delete_model, self.keep_model_after_pred):
-            # Get all unique positions that will be mutated
-            mutated_positions = set()
-            for mutant in mutants:
-                for sub in mutant:
-                    pos_idx = sub.pos - target.first_index
-                    mutated_positions.add(pos_idx)
-
-            # Pre-compute masked probabilities for each position that will be mutated
-            position_log_probs = {}
-            position_list = list(mutated_positions)
-
-            with torch.no_grad():
-                # Process positions in batches
-                for batch_start in range(0, len(position_list), self.batch_size):
-                    batch_end = min(
-                        batch_start + self.batch_size, len(position_list)
-                    )
-                    batch_positions = position_list[batch_start:batch_end]
-
-                    if status_callback:
-                        # First 50% for position processing
-                        progress = (batch_start / len(position_list)) * 50
-                        status_callback(
-                            "running", progress, f"Computing masked probabilities batch {batch_start//self.batch_size + 1}"
-                        )
-
-                    # Create masked sequences for this batch
-                    masked_seqs = []
-                    for pos_idx in batch_positions:
-                        masked_seq = list(instance_seq)
-                        masked_seq[pos_idx] = self.tokenizer.mask_token
-                        masked_seqs.append("".join(masked_seq))
-
-                    # Tokenize batch
-                    batch_inputs = self.tokenizer(
-                        masked_seqs,
-                        return_tensors="pt",
-                        padding=True,
-                        truncation=True
-                    ).to(self.device)
-
-                    # Single forward pass for batch
-                    outputs = self.model(**batch_inputs)
-
-                    # Extract probabilities for each position in the batch
-                    for batch_idx, pos_idx in enumerate(batch_positions):
-                        # Find mask token position in this sequence
-                        mask_token_id = self.tokenizer.mask_token_id
-                        mask_positions = (batch_inputs.input_ids[batch_idx] == mask_token_id).nonzero(  # noqa
-                            as_tuple=True
-                        )[0]
-
-                        if len(mask_positions) > 0:
-                            mask_pos = mask_positions[0]
-                            logits = outputs.logits[batch_idx, mask_pos]
-                            log_probs = torch.log_softmax(logits, dim=-1)
-                            position_log_probs[pos_idx] = log_probs
-                        else:
-                            raise ValueError(
-                                f"Mask token not found for position {pos_idx}")
-
-            # Calculate scores for all mutants using the pre-computed masked probabilities
-            mutant_scores = []
-            for i, mutant in enumerate(mutants):
-                if status_callback:
-                    # Second 50% for mutant scoring
-                    progress = 50 + ((i + 1) / len(mutants)) * 50
-                    status_callback(
-                        "running", progress, f"Scoring mutant {i + 1}/{len(mutants)}"
-                    )
-
-                total_score = 0.0
-
-                for sub in mutant:
-                    pos_idx = sub.pos - target.first_index
-                    wt_aa = instance_seq[pos_idx]
-                    mut_aa = sub.to
-
-                    if wt_aa == mut_aa:
-                        continue  # No change in score for unchanged positions
-
-                    # Get token IDs
-                    wt_token = self.tokenizer.convert_tokens_to_ids(wt_aa)
-                    mut_token = self.tokenizer.convert_tokens_to_ids(mut_aa)
-
-                    # Get the pre-computed log probabilities for this position
-                    log_probs = position_log_probs[pos_idx]
-
-                    # Calculate score difference for this mutation
-                    wt_log_prob = log_probs[wt_token].item()
-                    mut_log_prob = log_probs[mut_token].item()
-
-                    score_diff = (mut_log_prob - wt_log_prob)
-                    total_score += score_diff
-
-                mutant_scores.append(total_score)
-
-        return np.array(mutant_scores)
-
-    def score_conditional(
-        self,
-        instances: Sequence[SystemInstance],
-        entities: Sequence[int],
-        positions: Sequence[int],
-        status_callback: StatusCallback | None = None
-    ) -> pd.DataFrame:
-        """
-        Score conditional probabilities for specified positions in the sequences
-        using masked-marginals approach with batching for efficiency
-        """
-        self.ready_or_raise()
-        self._validate_instances(instances)
-
-        # Validate input parameters
-        if set(entities) != {0}:
-            raise ValueError("Can only specify entities with index 0")
-
-        if not len(instances) == len(entities) == len(positions):
-            raise ValueError(
-                "Sequences for instances, entities and positions must all have same length"
-            )
-
-        # Validate positions
-        target = self.system[0]
-        self.valid_positions(positions, entities=0, raise_invalid=True)
-
-        # Convert sequences to strings if needed
-        seqs = []
-        for instance in instances:
-            seq = instance[0].rep
-            seq = "".join(seq)
-            seqs.append(seq)
-
-        with model_param_context(self._load_model, self._delete_model, self.keep_model_after_pred):
-            conditionals_list = []
-
-            # Process in batches for efficiency
-            for batch_start in range(0, len(seqs), self.batch_size):
-                batch_end = min(batch_start + self.batch_size, len(seqs))
-                batch_seqs = seqs[batch_start:batch_end]
-                batch_positions = positions[batch_start:batch_end]
-                batch_entities = entities[batch_start:batch_end]
-                batch_indices = list(range(batch_start, batch_end))
-
-                if status_callback:
-                    progress = (batch_start / len(seqs)) * 100
-                    status_callback(
-                        "running", progress, f"Processing batch {batch_start//self.batch_size + 1}"
-                    )
-
-                # Create masked sequences for this batch
-                masked_seqs = []
-                for seq, pos in zip(batch_seqs, batch_positions):
-                    pos_idx = pos - target.first_index
-                    seq_list = list(seq)
-                    seq_list[pos_idx] = self.tokenizer.mask_token
-                    masked_seqs.append("".join(seq_list))
-
-                # Tokenize all masked sequences in the batch
-                inputs = self.tokenizer(
-                    masked_seqs,
-                    return_tensors="pt",
-                    padding=True,
-                    truncation=True
-                ).to(self.device)
-
-                with torch.no_grad():
-                    # Single forward pass for the entire batch
-                    outputs = self.model(**inputs)
-                    logits = outputs.logits
-
-                    # Process each sequence in the batch
-                    for batch_idx, (orig_idx, pos, entity) in enumerate(
-                        zip(batch_indices, batch_positions, batch_entities)
-                    ):
-                        # Find the position of the mask token in this sequence
-                        mask_token_id = self.tokenizer.mask_token_id
-                        mask_positions = (inputs.input_ids[batch_idx] == mask_token_id).nonzero(  # noqa
-                            as_tuple=True
-                        )[0]
-
-                        if len(mask_positions) == 0:
-                            raise ValueError(
-                                f"Mask token not found in sequence {orig_idx}")
-
-                        # Take first mask position
-                        mask_pos = mask_positions[0]
-
-                        # Get logits for the masked position
-                        pos_logits = logits[batch_idx, mask_pos]
-
-                        # Apply log softmax to get log probabilities
-                        log_probs = torch.log_softmax(pos_logits, dim=-1)
-
-                        # Convert to amino acid probabilities
-                        aa_probs = {}
-                        for aa in target.alphabet(include_gap=False):
-                            if aa == '-':  # Skip gap character
-                                aa_probs[aa] = 0.0
-                            else:
-                                aa_token_id = self.tokenizer.convert_tokens_to_ids(
-                                    aa)
-                                aa_probs[aa] = log_probs[aa_token_id].item()
-
-                        # Store results
-                        conditionals_list.append({
-                            'instance': orig_idx,
-                            'entity': entity,
-                            'pos': pos,
-                            **aa_probs
-                        })
-
-        # Create dataframe with proper index format
-        conditionals = pd.DataFrame(conditionals_list)
-        conditionals = conditionals.set_index(['instance', 'entity', 'pos'])
-
-        return conditionals
-
-    def transform(
-        self,
-        instances: Sequence[SystemInstance],
-        entity: int | None = None,
-        status_callback: StatusCallback | None = None   # noqa
-    ) -> List[SystemInstance]:
-        """
-        Transform system instances by adding embeddings from the ESM2 model
-        """
-        self.ready_or_raise()
-        self._validate_instances(instances)
-
-        # Default to entity 0 if not specified
-        entity = 0 if entity is None else entity
-        if entity != 0:
-            raise ValueError("Model can only handle one single entity")
-
-        with model_param_context(self._load_model, self._delete_model, self.keep_model_after_pred):
-            transformed_instances = []
-
-            # Process in batches
-            for batch_start in range(0, len(instances), self.batch_size):
-                batch_end = min(
-                    batch_start + self.batch_size, len(instances)
-                )
-                batch_instances = instances[batch_start:batch_end]
-
-                # Prepare batch sequences
-                sequences = []
-                for instance in batch_instances:
-                    seq = instance[0].rep
-                    seq = "".join(seq)
-                    sequences.append(seq)
-
-                # Tokenize sequences
-                inputs = self.tokenizer(
-                    sequences, return_tensors="pt", padding=True
-                ).to(self.device)
-
-                # Get embeddings
-                with torch.no_grad():
-                    outputs = self.model(**inputs, output_hidden_states=True)
-
-                    # Get the hidden states from the last layer
-                    # Note: For EsmForMaskedLM, the hidden states are typically accessed as:
-                    # hidden_states = outputs.hidden_states[-1]
-                    # Last layer hidden states
-                    hidden_states = outputs.hidden_states[-1]
-
-                    # Process each instance in the batch
-                    for i, instance in enumerate(batch_instances):
-                        # Create new entity instance
-                        new_entity = instance[0].copy()
-
-                        # Create a new SystemInstance with this entity
-                        new_instance = instance.copy()
-                        new_instance.entity_instances = [new_entity]
-
-                        # Get sequence length (excluding padding)
-                        # -2 for special tokens
-                        seq_len = len(self.tokenizer.encode(sequences[i])) - 2
-
-                        # Store the embedding (excluding the first token which is the start token)
-                        new_entity.embedding = hidden_states[i,
-                                                             1:seq_len+1].cpu().numpy()
-                        # Replace the entity instance in copied system instance
-                        new_instance.data = [new_entity]
-
-                        # Calculate and store score
-                        logits = outputs.logits[i, :-1]  # exclude last token
-                        token_probs = torch.log_softmax(logits, dim=-1)
-
-                        # Get the target tokens (shifted by one)
-                        target_tokens = inputs.input_ids[i, 1:seq_len+1]
-
-                        # Calculate log probabilities for target tokens
-                        seq_log_probs = torch.gather(
-                            token_probs,
-                            dim=1,
-                            index=target_tokens.unsqueeze(1)
-                        ).squeeze(1)
-
-                        new_instance.score = seq_log_probs.sum().item()
-                        transformed_instances.append(new_instance)
-
-        return transformed_instances
+    def __del__(self):
+        """Cleanup temporary files"""
+        if hasattr(self, 'pdb_path') and self.pdb_path and os.path.exists(self.pdb_path):
+            os.unlink(self.pdb_path)
