@@ -615,8 +615,9 @@ class LigandMPNNWrapper(BaseModel, Scorer, Generator):
             num_batches = (num_designs + batch_size - 1) // batch_size
             for batch_idx in range(num_batches):
                 if status_callback:
+
                     status_callback(
-                        f"Generating batch {batch_idx + 1}/{num_batches}")
+                        "running", None, f"Generating batch {batch_idx + 1}/{num_batches}")
 
                 feature_dict_copy["randn"] = torch.randn(
                     [batch_size, L], device=self.device)
@@ -739,8 +740,8 @@ class LigandMPNNWrapper(BaseModel, Scorer, Generator):
         with torch.no_grad():
             for seq_idx, seq in enumerate(sequences):
                 if status_callback:
-                    status_callback(
-                        f"Scoring sequence {seq_idx + 1}/{len(sequences)}")
+                    status_callback("running", seq_idx / len(sequences),
+                                    f"Scoring sequence {seq_idx + 1}/{len(sequences)}")
 
                 # Convert sequence to tensor
                 S_tensor = torch.tensor(
