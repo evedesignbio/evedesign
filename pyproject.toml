@@ -3,12 +3,12 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [project]
-name = "protdesign"
+name = "evedesign"
 dynamic = ["version"]
 description = ''
 readme = "README.md"
-requires-python = ">=3.8"
-license = "licenseref-proprietary"
+requires-python = ">=3.12"
+license = "MIT"
 keywords = []
 authors = [
   { name = "Thomas Hopf", email = "thomas.hopf@gmail.com" },
@@ -16,42 +16,46 @@ authors = [
 classifiers = [
   "Development Status :: 4 - Beta",
   "Programming Language :: Python",
-  "Programming Language :: Python :: 3.8",
-  "Programming Language :: Python :: 3.9",
-  "Programming Language :: Python :: 3.10",
-  "Programming Language :: Python :: 3.11",
   "Programming Language :: Python :: 3.12",
   "Programming Language :: Python :: Implementation :: CPython",
   "Programming Language :: Python :: Implementation :: PyPy",
 ]
-dependencies = ["numpy", "pandas", "loguru"]
+dependencies = [
+  "numpy", "pandas", "torch", "loguru", "biotite", "biopython", "dnachisel", "scikit-learn", "numba", "scipy"
+]
+
+[project.optional-dependencies]
+evmutation2 = ["evmutation2"]
+esm2 = ["transformers"]
+mpnn = ["prody"]
+umap = ["umap-learn"]
 
 [project.urls]
-Documentation = "https://github.com/thomashopf/protdesign#readme"
-Issues = "https://github.com/thomashopf/protdesign/issues"
-Source = "https://github.com/thomashopf/protdesign"
+Documentation = "https://github.com/evedesignbio/evedesign#readme"
+Issues = "https://github.com/evedesignbio/evedesign/issues"
+Source = "https://github.com/evedesignbio/evedesign"
 
 [tool.hatch.version]
-path = "src/protdesign/__about__.py"
+path = "src/evedesign/__about__.py"
 
 [tool.hatch.envs.types]
 extra-dependencies = [
   "mypy>=1.0.0",
 ]
 [tool.hatch.envs.types.scripts]
-check = "mypy --install-types --non-interactive {args:src/protdesign tests}"
+check = "mypy --install-types --non-interactive {args:src/evedesign tests}"
 
 [tool.coverage.run]
-source_pkgs = ["protdesign", "tests"]
+source_pkgs = ["evedesign", "tests"]
 branch = true
 parallel = true
 omit = [
-  "src/protdesign/__about__.py",
+  "src/evedesign/__about__.py",
 ]
 
 [tool.coverage.paths]
-protdesign = ["src/protdesign", "*/protdesign/src/protdesign"]
-tests = ["tests", "*/protdesign/tests"]
+evedesign = ["src/evedesign", "*/evedesign/src/evedesign"]
+tests = ["tests", "*/evedesign/tests"]
 
 [tool.coverage.report]
 exclude_lines = [
