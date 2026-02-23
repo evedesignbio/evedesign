@@ -30,7 +30,7 @@ pip install evedesign[evmutation2,esm2,mpnn,umap]
 
 ## Getting started
 
-Please refer to some of our [examples](Examples) how to use *evedesign*. We are planning to extend these further in the near future.
+Please refer to some of our [examples](examples) how to use *evedesign*. We are planning to extend these further in the near future.
 
 ## Roadmap and contributing
 
