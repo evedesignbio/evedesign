@@ -32,6 +32,7 @@ except ImportError:
     IMPORT_AVAILABLE = False
 
 MODEL_BASE_URL = "https://files.ipd.uw.edu/pub/ligandmpnn"
+DEFAULT_CHECKPOINT_PATH = os.path.expanduser("~/.cache/mpnn")
 
 # Model checkpoint URLs
 MODEL_URLS = {
@@ -135,7 +136,7 @@ class LigandMPNN(BaseModel, Scorer, Generator, MutationScorer, ConditionalMutati
         fix_full_decoding_order: bool = False,
         vary_decoding_order_per_instance: bool = False,
         keep_model_after_build: bool = False,
-        cache_dir: str | None = "./model_params",
+        cache_dir: str | None = DEFAULT_CHECKPOINT_PATH,
         device: DeviceType = "cpu"
     ):
         """

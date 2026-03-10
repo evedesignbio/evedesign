@@ -1878,4 +1878,3 @@ class Ligand(Entity):
             symmetry=symmetry
         )
 
-# mapping from entity index to positions in entity (e.g. for fixing positions)

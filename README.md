@@ -32,6 +32,14 @@ pip install evedesign[evmutation2,esm2,mpnn,umap]
 
 Please refer to some of our [examples](examples) how to use *evedesign*. We are planning to extend these further in the near future.
 
+To implement your own models in the framework, please have a look at our existing reference implementations 
+(e.g. [EVmutation2](src/evedesign/models/evmutation2.py), [ESM-2](src/evedesign/models/esm2.py), 
+[ProteinMPNN](src/evedesign/models/mpnn.py), [Gibbs sampler](src/evedesign/samplers/gibbs.py)) as well as
+the underlying [model interfaces](src/evedesign/model.py) and
+[description of molecular systems and instances](src/evedesign/system.py).
+
+We are happy to help if you have any questions!
+
 ## Roadmap and contributing
 
 We plan to continuously add more models, restraints, oracles and samplers to the framework, e.g. *de novo* 3D structure generation
@@ -39,7 +47,6 @@ with BoltzGen or BindCraft.
 
 We are actively looking for further contributors to develop our framework jointly with the community. 
 If you are interested or feel like an important model is missing from the framework, please get in contact with us!
-
 
 ## License
 

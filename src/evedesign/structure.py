@@ -14,7 +14,6 @@ import biotite.structure.io.pdb as pdb
 import biotite.structure.io.pdbx as pdbx
 import biotite.database.rcsb as rcsb
 from biotite.structure import AtomArray
-
 from evedesign.constants import RESIDUE_MAX_SASA, AA3_to_AA1
 from evedesign.utils import map_array
 
@@ -213,6 +212,23 @@ class Structure:
             self.atom_array[self.atom_array.chain_id == chain_id]
         )
 
+    def single_chain_no_inscode_or_raise(self):
+        """
+        Verify that structure only contains a single chain and
+        no insertion codes
+        """
+        unique_ins_codes = np.unique(self.atom_array.ins_code)
+        if len(unique_ins_codes) != 1 or unique_ins_codes[0] != "":
+            raise ValueError(
+                "Model contains insertion codes, cannot remap numbering"
+            )
+
+        unique_chains = np.unique(self.atom_array.chain_id)
+        if len(unique_chains) != 1:
+            raise ValueError(
+                "Can only map a unique chain identifier"
+            )
+
     def remap(
         self,
         mapping: dict[int, int],
@@ -234,17 +250,7 @@ class Structure:
         -------
         Single-chain model with updated numbering
         """
-        unique_ins_codes = np.unique(self.atom_array.ins_code)
-        if len(unique_ins_codes) != 1 or unique_ins_codes[0] != "":
-            raise ValueError(
-                "Model contains insertion codes, cannot remap numbering"
-            )
-
-        unique_chains = np.unique(self.atom_array.chain_id)
-        if len(unique_chains) != 1:
-            raise ValueError(
-                "Can only map a unique chain identifier"
-            )
+        self.single_chain_no_inscode_or_raise()
 
         # determine which positions will be mapped, discard others
         mapped_pos = np.isin(self.atom_array.res_id, list(mapping))
@@ -633,3 +639,4 @@ class StructureFile:
             raise NotImplementedError(
                 "Sequences not available for legacy PDB format (not implemented in biotite)"
             )
+
