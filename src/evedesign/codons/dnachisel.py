@@ -88,7 +88,7 @@ class DNAChiselCodonOptimizer(ProteinToDnaOptimizer):
             If cpu > 1, parallelize optimization over different instances with specified number of processes.
         """
         if not self.available:
-            raise ValueError(
+            raise ImportError(
                 "dnachisel or biopython package could not be imported. Are they already installed?"
             )
 

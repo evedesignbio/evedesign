@@ -5,6 +5,8 @@
 
 -----
 
+<p align="center"><img src=".github/evedesign_logo.png" alt="evedesign logo" style="width:50%;" /></p>
+
 ## What is evedesign?
 
 *evedesign* is a unified open-source framework for biosequence design that formalizes conditional design problems in a method-agnostic way. The framework allows users to seamlessly build and execute complex multiobjective design workflows, including supervised and unsupervised models, from a standardized set of specifications and operations. An interactive web-based user interface facilitates end-to-end biomolecular design for a broad scientific audience and is publicly available at https://evedesign.bio. 
@@ -16,9 +18,10 @@ Please also check [evedesign-server](https://github.com/evedesignbio/evedesign-s
 from declarative design specifications and the REST API, as well as [evedesign-ui](https://github.com/evedesignbio/evedesign-ui)
 for the interactive user interface. 
 
-## Reference
+## Publication
 
-Our preprint describing the core concepts behind the evedesign framework will be posted here shortly.
+[Hopf TA, Gazizov A, Garcia Busto S, Eschbach E, Lee S, Mirdita M, Orenbuch R, Belahsen K, Ross D, Sander C, Steinegger M, d'Oelsnitz S, Marks D. evedesign: accessible biosequence design with a unified
+framework. bioRxiv (2026) doi:10.64898/2026.03.17.712115](https://www.biorxiv.org/content/10.64898/2026.03.17.712115v1)
 
 ## Installation
 

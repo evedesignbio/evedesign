@@ -5,7 +5,6 @@ from typing import Sequence, Self, Literal
 import urllib.request
 
 import numpy as np
-import torch
 from loguru import logger
 
 from evedesign.model import (
@@ -16,17 +15,18 @@ from evedesign.structure import Structure
 from evedesign.utils import ensure_sequence, model_param_context
 from evedesign.types import DeviceType, StatusCallback, BatchSize, EntityPosList
 
-# Import the LigandMPNN modules
-from evedesign.models.ligandmpnn.data_utils import (
-    featurize,
-    parse_PDB,
-    restype_str_to_int,
-    restype_int_to_str,
-    get_score,
-)
-from evedesign.models.ligandmpnn.model_utils import ProteinMPNN
 try:
+    import torch
     import prody
+    # Import the LigandMPNN modules, these also depend on torch
+    from evedesign.models.ligandmpnn.model_utils import ProteinMPNN
+    from evedesign.models.ligandmpnn.data_utils import (
+        featurize,
+        parse_PDB,
+        restype_str_to_int,
+        restype_int_to_str,
+        get_score,
+    )
     IMPORT_AVAILABLE = True
 except ImportError:
     IMPORT_AVAILABLE = False
@@ -169,6 +169,11 @@ class LigandMPNN(BaseModel, Scorer, Generator, MutationScorer, ConditionalMutati
         device
             Device to use for computations
         """
+        if not self.available:
+            raise ImportError(
+                "MPNN dependencies could not be imported. Are they installed already?"
+            )
+
         self.model_name = model_name
         self.device = device
         self.batch_size = batch_size

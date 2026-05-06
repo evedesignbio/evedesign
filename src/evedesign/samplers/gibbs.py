@@ -6,7 +6,7 @@ Implementation assumes fixed length of sequences (no inserts, deletions can be s
 from typing import Sequence, Literal, Callable
 import numpy as np
 import pandas as pd
-import torch
+from scipy.special import softmax
 from loguru import logger
 from evedesign.constants import GAP
 from evedesign.model import Generator, ConditionalMutationScorer, Scorer
@@ -705,24 +705,23 @@ class GibbsSampler(Generator):
 
                 # replace any missing values to exclude from sampling, and scale by temperature for current step;
                 # Note we are using an inverted scale here (e.g. not -E/T but E/T where higher E means "better");
-                # we go through pytorch here to use the parallelized multinomial implementation which is much
-                # more suitable here
-                scores_scaled = torch.from_numpy(
-                    agg_scores.replace(np.nan, -np.inf).to_numpy(copy=True)
-                ) / step_temp
+                scores_scaled = agg_scores.replace(np.nan, -np.inf).to_numpy(copy=True) / step_temp
 
-                p = scores_scaled.softmax(dim=-1)
+                p = softmax(scores_scaled, axis=-1)
 
-                sampled_token_idx = torch.multinomial(
-                    p, num_samples=1
-                ).flatten()
+                # note: originally used torch.multinomial here but removed to eliminate pytorch dependency
+                # in this generic module
+                # sampled_token_idx = torch.multinomial(p, num_samples=1).flatten()
+                sampled_token_idx = np.array([
+                    self.rng.choice(len(p_row), size=None, p=p_row) for p_row in p
+                ])
 
-                sampled_tokens = alphabet_array[sampled_token_idx.numpy()]
+                sampled_tokens = alphabet_array[sampled_token_idx]
 
                 # compute temperature-scaled score difference to current token
                 score_diff = (
                     scores_scaled[design_idx_all, sampled_token_idx] - scores_scaled[design_idx_all, current_token_idx]
-                ).numpy()
+                )
 
                 # update sample matrix and instances for next step
                 assert len(design_idx_all) == len(step_ent) == len(step_pos) == len(sampled_tokens)

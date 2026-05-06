@@ -790,7 +790,7 @@ class SequenceSpaceUMAP(SequenceSpaceProjectionAligned):
             Keyword arguments forwarded to constructor of umap.UMAP
         """
         if not self.available:
-            raise ValueError(
+            raise ImportError(
                 "umap package is not available, please install first"
             )
 

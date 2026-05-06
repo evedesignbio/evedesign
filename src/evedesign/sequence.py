@@ -3,13 +3,14 @@ Biopolymer sequence functionality (protein sequences etc.)
 """
 from string import ascii_lowercase
 from typing import Any, Literal, Self, TextIO
+from pathlib import Path
 from collections import abc
 from evedesign.constants import MASK, GAP
 from evedesign.types import BioPolymer, RepSequence, SequenceMetadata
 from evedesign.utils import shorten
 
 
-REMOVE_INSERTIONS_TRANSLATION = str.maketrans("", "", ascii_lowercase)
+REMOVE_INSERTIONS_TRANSLATION = str.maketrans("", "", ascii_lowercase + ".")
 
 
 class Sequence:
@@ -144,7 +145,7 @@ class Sequences:
         aligned: bool = False,
         type: BioPolymer = "protein",  # noqa
         weights: abc.Sequence[float] | None = None,
-        format: Literal["a3m", "a2m", "fasta"] | None = None,  # noqa
+        format: Literal["a3m", "a2m", "fasta", "fasta_unaligned"] | None = None,  # noqa
     ):
         self.seqs = seqs
         self.aligned = aligned
@@ -154,12 +155,61 @@ class Sequences:
         # TODO: check alignment integrity and/or autodetect properties/format
 
     @classmethod
-    def from_file(cls, f: TextIO):
-         # TODO: parameter for different format types
-         # TODO: callback param for header parsing
-        raise NotImplementedError(
-            "Loading from file not yet implemented"
+    def from_file(
+        cls,
+        path: str | Path,
+        format: Literal["a3m", "a2m", "fasta", "fasta_unaligned"],
+        type: BioPolymer = "protein"
+    ) -> Self:
+        """
+        Load sequences from a file.
+        """
+        file_path = Path(path)
+        seq_list = []
+        expected_match_len = None
+
+        aligned = format != "fasta_unaligned"
+
+        with open(file_path, "r") as f:
+            for seq_id, seq_str in read_fasta(f):
+                # only perform match state checking for aligned formats
+                if aligned:
+                    match_seq = seq_str.translate(REMOVE_INSERTIONS_TRANSLATION)
+                    current_match_len = len(match_seq)
+
+                    if expected_match_len is None:
+                        expected_match_len = current_match_len
+                    elif current_match_len != expected_match_len:
+                        raise ValueError(
+                            f"Inconsistent alignment length in {file_path.name}: "
+                            f"'{seq_id}' has {current_match_len} match states, expected {expected_match_len}."
+                        )
+
+                seq_list.append(
+                    Sequence(seq=seq_str, id=seq_id, type=type)
+                )
+
+        return cls(
+            seqs=seq_list,
+            aligned=aligned,
+            type=type,
+            format=format,
         )
+        
+    def remove_inserts(self) -> Self:
+        """
+        Remove any insertions (lowercase letters or periods) from all sequences relative to target
+        """
+        
+        if self.format_ == 'fasta':
+            raise NotImplementedError(f"remove_inserts is not supported for format: {self.format_}")
+        
+        return type(self)(
+            seqs=[s.remove_insertions() for s in self.seqs],
+            aligned=True,
+            weights=self.weights,
+            format=self.format_
+        )        
 
     def serialize(self) -> dict[str, Any]:
         """
