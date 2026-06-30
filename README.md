@@ -41,6 +41,11 @@ To implement your own models in the framework, please have a look at our existin
 the underlying [model interfaces](src/evedesign/model.py) and
 [description of molecular systems and instances](src/evedesign/system.py).
 
+The [EVcouplings wrapper](src/evedesign/models/evcouplings.py) supports aligned protein, DNA, and RNA
+MSAs. It can also model homogeneous multi-entity systems by concatenating paired MSAs; for these systems,
+provide one aligned MSA per entity with rows in matching order, or matching `Sequence.key` values for
+explicit pair validation.
+
 We are happy to help if you have any questions!
 
 ## Roadmap and contributing

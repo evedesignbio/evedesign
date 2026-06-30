@@ -28,7 +28,7 @@ dependencies = [
 
 [project.optional-dependencies]
 evmutation2 = ["torch", "evmutation2"]
-evcouplings = ["evcouplings"]
+evcouplings = ["evcouplings", "setuptools<81"]
 esm2 = ["torch", "transformers"]
 mpnn = ["torch", "prody"]
 umap = ["umap-learn"]

@@ -2,7 +2,8 @@
 Wrapper classes around the EVcouplings/EVmutation Potts model
 
 This wrapper deliberately keeps only the two stages of the evcouplings pipeline that
-are relevant for modelling a single, already-aligned protein family inside evedesign:
+are relevant for modelling already-aligned protein or nucleotide families inside
+evedesign:
 
 MSA construction is out of scope: the provided System is expected to already carry a MSA
 
@@ -31,13 +32,24 @@ from evedesign.model import (
     ConditionalMutationScorer,
     assign_scores_to_instances,
 )
+from evedesign.sequence import Sequence as EvedesignSequence, Sequences
 from evedesign.system import System, SystemInstance, Entity
 from evedesign.constants import GAP, MASK
 from evedesign.types import StatusCallback
 from evedesign.utils import status_done, status_start
 
+if not hasattr(np, "in1d"):
+    # EVcouplings 0.2.1 still calls np.in1d, which was removed in NumPy 2.
+    np.in1d = np.isin
+
 try:
-    from evcouplings.align.alignment import Alignment, ALPHABET_PROTEIN
+    from evcouplings.align.alignment import (
+        Alignment,
+        ALPHABET_DNA,
+        ALPHABET_PROTEIN,
+        ALPHABET_RNA,
+    )
+    from evcouplings.couplings.mapping import Segment, SegmentIndexMapper
     from evcouplings.couplings.mean_field import MeanFieldDCA
     from evcouplings.couplings.model import (
         CouplingsModel,
@@ -79,6 +91,7 @@ class EVcouplings(BaseModel, Scorer, MutationScorer, ConditionalMutationScorer):
     supports_cpu_parallel: bool = False
 
     _honors_precomputed_weights: bool = True
+    _supported_entity_types: set[str] = {"protein", "dna", "rna"}
 
     required_entity_attributes: list[str] | None = ["sequences"]
     optional_entity_attributes: list[str] | None = None
@@ -120,6 +133,12 @@ class EVcouplings(BaseModel, Scorer, MutationScorer, ConditionalMutationScorer):
         self.model: CouplingsModel | None = None
         # residue indices of the positions w/ enough coverage
         self._index_list: np.ndarray | None = None
+        self._index_mapper: "SegmentIndexMapper | None" = None
+        self._segment_id_to_entity: dict[str, int] = {}
+        self._model_position_map: list[tuple[int, int]] = []
+        self._entity_pos_to_model: dict[tuple[int, int], int] = {}
+        self._modelled_entities: list[int] = []
+        self._alphabet: str | None = None
 
 
     @property
@@ -135,63 +154,209 @@ class EVcouplings(BaseModel, Scorer, MutationScorer, ConditionalMutationScorer):
         if data is not None:
             return False, "Model does not support a data parameter (must be None)"
 
-        # will eventually include evcomplex, would have been kind of a lot of work
-        # and not sure if evedesign can handle paired MSA+instances without modification
-        if len(system) != 1 or system[0].type != "protein":
-            return False, "Can only handle a single-component protein system"
+        if len(system) == 0:
+            return False, "System must contain at least one entity"
 
-        target = system[0]
-        if not target.defined_sequence():
-            return False, "Entity must have a defined rep sequence"
+        entity_types = {entity.type for entity in system}
+        if not entity_types <= cls._supported_entity_types:
+            return False, "Can only handle protein, DNA, or RNA biopolymer entities"
 
-        if target.sequences is None or len(target.sequences.seqs) == 0:
-            return False, "Must provide an MSA (entity.sequences) for model inference"
+        if len(entity_types) != 1:
+            return False, "All modelled entities must have the same biopolymer type"
 
-        if not target.sequences.aligned:
-            return False, "Provided sequences must be aligned"
+        aligned_records = []
+        for entity_idx, entity in enumerate(system):
+            if not entity.defined_sequence():
+                return False, f"Entity {entity_idx} must have a defined rep sequence"
+
+            if entity.sequences is None or len(entity.sequences.seqs) == 0:
+                return False, (
+                    f"Entity {entity_idx} must provide an MSA "
+                    "(entity.sequences) for model inference"
+                )
+
+            if entity.sequences.type_ != entity.type:
+                return False, (
+                    f"Entity {entity_idx} sequence type {entity.sequences.type_!r} "
+                    f"does not match entity type {entity.type!r}"
+                )
+
+            if not entity.sequences.aligned:
+                return False, f"Entity {entity_idx} sequences must be aligned"
+
+            try:
+                seqs = entity.sequences.to_a3m().remove_inserts().seqs
+            except NotImplementedError as exc:
+                return False, f"Entity {entity_idx} sequences must be convertible to A3M: {exc}"
+
+            target_rep = "".join(entity.rep)
+            bad = [i for i, seq in enumerate(seqs) if len(seq.seq) != len(target_rep)]
+            if bad:
+                return False, (
+                    f"Entity {entity_idx} MSA match-state length does not match "
+                    f"target length ({len(target_rep)}) for sequence index {bad[0]}"
+                )
+
+            if seqs[0].seq != target_rep:
+                return False, (
+                    f"Entity {entity_idx} first MSA sequence must equal the "
+                    "target/focus sequence"
+                )
+
+            aligned_records.append(seqs)
+
+        row_counts = {len(records) for records in aligned_records}
+        if len(row_counts) != 1:
+            return False, "Paired MSAs must contain the same number of rows for each entity"
+
+        if len(system) > 1:
+            row_count = row_counts.pop()
+            for row_idx in range(row_count):
+                keys = [
+                    records[row_idx].key
+                    for records in aligned_records
+                    if records[row_idx].key is not None
+                ]
+                if len(keys) > 1 and len(set(keys)) != 1:
+                    return False, (
+                        "Paired MSA sequence keys must match across entities "
+                        f"at row {row_idx}"
+                    )
 
         return True, ""
 
 
-    def _build_alignment(self, target) -> tuple["Alignment", np.ndarray]:
-        """
-        Build an evcouplings Alignment from the system MSA and lower-case
-        the high-gap columns so they are excluded from the fit
+    @classmethod
+    def _alphabet_for_entity(cls, entity: Entity) -> str:
+        if entity.type == "protein":
+            return ALPHABET_PROTEIN
+        if entity.type == "dna":
+            return ALPHABET_DNA
+        if entity.type == "rna":
+            return ALPHABET_RNA
+        raise ValueError(f"Unsupported EVcouplings entity type: {entity.type!r}")
 
-        Match-state columns are obtained by converting the MSA to a3m and stripping
-        insertions; the alignment is numbered from a fixed first index of 1 (any mapping
-        back to the entity's first_index is handled by positions()/score()).
+    @classmethod
+    def _segment_type_for_entity(cls, entity: Entity) -> str:
+        if entity.type == "protein":
+            return "aa"
+        if entity.type in {"dna", "rna"}:
+            return entity.type
+        raise ValueError(f"Unsupported EVcouplings entity type: {entity.type!r}")
 
-        Returns the (possibly modified) Alignment and the boolean mask of excluded columns
-        """
-        target_rep = "".join(target.rep)
+    @staticmethod
+    def _segment_id(entity_idx: int) -> str:
+        if entity_idx < 26:
+            return chr(ord("A") + entity_idx)
+        return f"E{entity_idx}"
+
+    @staticmethod
+    def _sequence_id(seq: EvedesignSequence, fallback: str) -> str:
+        if seq.id_ is None:
+            return fallback
+        return str(seq.id_).split()[0]
+
+    def _entity_match_records(
+        self,
+        entity: Entity,
+        entity_idx: int,
+    ) -> tuple[list[EvedesignSequence], list[str]]:
+        target_rep = "".join(entity.rep)
         length = len(target_rep)
 
-        seqs = target.sequences.to_a3m().remove_inserts().seqs
+        seqs = entity.sequences.to_a3m().remove_inserts().seqs
         match_seqs = [s.seq for s in seqs]
 
         bad = [i for i, m in enumerate(match_seqs) if len(m) != length]
         if bad:
             raise ValueError(
-                f"MSA match-state length does not match target length ({length}) "
-                f"for {len(bad)} sequence(s), e.g. sequence index {bad[0]}"
+                f"Entity {entity_idx} MSA match-state length does not match "
+                f"target length ({length}) for {len(bad)} sequence(s), "
+                f"e.g. sequence index {bad[0]}"
             )
 
         if match_seqs[0] != target_rep:
             raise ValueError(
-                "First MSA sequence (match states) must equal the target/focus sequence. "
-                "EVcouplings requires the target sequence as the first alignment record"
+                f"Entity {entity_idx} first MSA sequence (match states) must "
+                "equal the target/focus sequence. EVcouplings requires the "
+                "target sequence as the first alignment record"
             )
 
-        # fixed internal numbering starting at 1
-        focus_id = str(seqs[0].id_).split()[0]
+        return seqs, match_seqs
+
+    def _build_alignment(
+        self,
+        system: System,
+    ) -> tuple["Alignment", "Sequences", str, int]:
+        """
+        Build an evcouplings Alignment from system MSAs and lower-case
+        high-gap columns so they are excluded from the fit.
+
+        Multi-entity systems are represented as paired MSAs concatenated in entity
+        order. The alignment is numbered from a fixed first index of 1; mapping back
+        to evedesign entity positions is handled with SegmentIndexMapper.
+
+        Returns the possibly modified Alignment, the concatenated sequence record
+        used for fallback weighting, the focus id, and the total target length.
+        """
+        alphabet = self._alphabet_for_entity(system[0])
+        seqs_by_entity = []
+        match_seqs_by_entity = []
+        segments = []
+        self._segment_id_to_entity = {}
+        self._modelled_entities = list(range(len(system)))
+
+        for entity_idx, entity in enumerate(system):
+            seqs, match_seqs = self._entity_match_records(entity, entity_idx)
+            seqs_by_entity.append(seqs)
+            match_seqs_by_entity.append(match_seqs)
+
+            segment_id = self._segment_id(entity_idx)
+            self._segment_id_to_entity[segment_id] = entity_idx
+            segments.append(
+                Segment(
+                    self._segment_type_for_entity(entity),
+                    entity.id or f"entity_{entity_idx}",
+                    int(entity.first_index),
+                    int(entity.first_index) + len(entity.rep) - 1,
+                    segment_id=segment_id,
+                )
+            )
+
+        row_counts = {len(records) for records in seqs_by_entity}
+        if len(row_counts) != 1:
+            raise ValueError("Paired MSAs must contain the same number of rows for each entity")
+        row_count = row_counts.pop()
+
+        for row_idx in range(row_count):
+            keys = [
+                records[row_idx].key
+                for records in seqs_by_entity
+                if records[row_idx].key is not None
+            ]
+            if len(keys) > 1 and len(set(keys)) != 1:
+                raise ValueError(
+                    "Paired MSA sequence keys must match across entities "
+                    f"at row {row_idx}"
+                )
+
+        match_seqs = [
+            "".join(entity_match_seqs[row_idx] for entity_match_seqs in match_seqs_by_entity)
+            for row_idx in range(row_count)
+        ]
+        total_length = len(match_seqs[0])
+
+        focus_id = self._sequence_id(seqs_by_entity[0][0], "focus")
         ids = (
-            [f"{focus_id}/1-{length}"]
-            + [str(s.id_) for s in seqs[1:]]
+            [f"{focus_id}/1-{total_length}"]
+            + [
+                self._sequence_id(seqs_by_entity[0][row_idx], f"seq{row_idx}")
+                for row_idx in range(1, row_count)
+            ]
         )
 
         matrix = np.array([list(m) for m in match_seqs])
-        alignment = Alignment(matrix, sequence_ids=ids, alphabet=ALPHABET_PROTEIN)
+        alignment = Alignment(matrix, sequence_ids=ids, alphabet=alphabet)
 
         # unweighted per-column gap frequency, exclude columns above the threshold
         gap_freq = alignment.count(GAP, axis="pos", normalize=True)
@@ -206,7 +371,24 @@ class EVcouplings(BaseModel, Scorer, MutationScorer, ConditionalMutationScorer):
             # lower-casing turns these into fake insert columns, which get stripped later
             alignment = alignment.lowercase_columns(np.where(excluded)[0])
 
-        return alignment, excluded
+        self._index_mapper = SegmentIndexMapper(True, 1, *segments)
+
+        concatenated_sequences = Sequences(
+            seqs=[
+                EvedesignSequence(
+                    seq=seq,
+                    id=ids[row_idx].split("/")[0],
+                    key=seqs_by_entity[0][row_idx].key,
+                    type=system[0].type,
+                )
+                for row_idx, seq in enumerate(match_seqs)
+            ],
+            aligned=True,
+            type=system[0].type,
+            format="a3m",
+        )
+
+        return alignment, concatenated_sequences, focus_id, total_length
 
 
     @abstractmethod
@@ -222,6 +404,51 @@ class EVcouplings(BaseModel, Scorer, MutationScorer, ConditionalMutationScorer):
         """
         raise NotImplementedError
 
+    def _sequence_weights(
+        self,
+        system: System,
+        concatenated_sequences: Sequences,
+    ) -> Sequence[float] | None:
+        if len(system) == 1:
+            weights = system[0].sequences.weights
+        else:
+            weights_by_entity = [entity.sequences.weights for entity in system]
+            provided_weights = [weights for weights in weights_by_entity if weights is not None]
+            if len(provided_weights) == 0:
+                weights = None
+            elif len(provided_weights) != len(system):
+                raise ValueError(
+                    "Precomputed weights for paired MSAs must be provided for all "
+                    "entities, or for none of them"
+                )
+            elif not all(np.allclose(provided_weights[0], weights) for weights in provided_weights[1:]):
+                raise ValueError("Precomputed weights for paired MSAs must match across entities")
+            else:
+                weights = provided_weights[0]
+
+        return weights
+
+    def _entity_position_for_model_pos(self, model_pos: int) -> tuple[int, int]:
+        segment_id, pos = self._index_mapper.to_target(int(model_pos))
+        return self._segment_id_to_entity[segment_id], int(pos)
+
+    def _set_model_position_maps(self) -> None:
+        self._model_position_map = [
+            self._entity_position_for_model_pos(int(pos)) for pos in self._index_list
+        ]
+        self._entity_pos_to_model = {
+            entity_pos: model_idx
+            for model_idx, entity_pos in enumerate(self._model_position_map)
+        }
+
+    def _model_subsequence(self, instance: SystemInstance) -> np.ndarray:
+        symbols = []
+        for entity_idx, pos in self._model_position_map:
+            entity = self.system[entity_idx]
+            offset = int(pos) - int(entity.first_index)
+            symbols.append(str(np.asarray(instance[entity_idx].rep)[offset]))
+        return np.asarray(symbols, dtype="U1")
+
 
     def build(
         self,
@@ -234,22 +461,23 @@ class EVcouplings(BaseModel, Scorer, MutationScorer, ConditionalMutationScorer):
         status_start(status_callback, "Fitting EVcouplings model")
 
         self._system = system
-        target = system[0]
 
         # reset any previous fit
         self.model = None
         self._index_list = None
+        self._index_mapper = None
+        self._model_position_map = []
+        self._entity_pos_to_model = {}
+        self._alphabet = self._alphabet_for_entity(system[0])
 
-        alignment, _ = self._build_alignment(target)
+        alignment, concatenated_sequences, focus_id, _ = self._build_alignment(system)
 
         # number of modelled positions = match columns
-        focus_id = str(target.sequences.seqs[0].id_).split()[0]
         num_model_positions = int(
             np.array([c.isupper() and c != GAP for c in alignment[0]]).sum()
         )
 
-        weights = target.sequences.weights
-
+        weights = self._sequence_weights(system, concatenated_sequences)
         needs_theta = weights is None or not self._honors_precomputed_weights
         if needs_theta and self.theta is None:
             raise ValueError(
@@ -258,10 +486,11 @@ class EVcouplings(BaseModel, Scorer, MutationScorer, ConditionalMutationScorer):
             )
 
         if weights is None and self._honors_precomputed_weights:
-            weights = target.sequences.compute_weights(theta=self.theta).weights
+            weights = concatenated_sequences.compute_weights(theta=self.theta).weights
 
         self.model = self._fit(alignment, focus_id, num_model_positions, weights)
         self._index_list = np.asarray(self.model.index_list, dtype=int)
+        self._set_model_position_maps()
 
         status_done(status_callback, "EVcouplings model finished fitting")
 
@@ -273,12 +502,11 @@ class EVcouplings(BaseModel, Scorer, MutationScorer, ConditionalMutationScorer):
         instance: SystemInstance | None = None,
     ) -> list[tuple[int, int]]:
         """
-        Return the modelled positions (in entity 0). Positions excluded due to high gap
+        Return the modelled positions. Positions excluded due to high gap
         content are not part of the fitted model and are therefore not returned
         """
         self.ready_or_raise()
-        first_index = self.system[0].first_index
-        return [(0, int(pos) - 1 + first_index) for pos in self._index_list]
+        return list(self._model_position_map)
 
 
     # elected to score full sequence to avoid dealing with indexing
@@ -301,12 +529,9 @@ class EVcouplings(BaseModel, Scorer, MutationScorer, ConditionalMutationScorer):
 
         status_start(status_callback, "Scoring sequences")
 
-        col_pos = self._index_list - 1
-
         subseqs = []
         for instance in instances:
-            rep = instance[0].rep
-            subseq = "".join(str(c) for c in np.asarray(rep)[col_pos])
+            subseq = "".join(self._model_subsequence(instance))
             subseqs.append(subseq)
 
         # column 0 is the total Hamiltonian (J_ij + h_i sub-sums in columns 1, 2)
@@ -323,7 +548,7 @@ class EVcouplings(BaseModel, Scorer, MutationScorer, ConditionalMutationScorer):
         instance: SystemInstance,
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         """
-        Map the entity-0 rep of an instance onto the model-internal integer background
+        Map an instance onto the model-internal integer background
         over the modelled (non-excluded) positions.
 
         Returns
@@ -336,8 +561,7 @@ class EVcouplings(BaseModel, Scorer, MutationScorer, ConditionalMutationScorer):
             Boolean array of length L, True where the symbol is not in the model alphabet
         """
         model = self.model
-        col_pos = self._index_list - 1
-        subseq = np.asarray(instance[0].rep)[col_pos]
+        subseq = self._model_subsequence(instance)
 
         bg = np.zeros(model.L, dtype=int)
         invalid = np.zeros(model.L, dtype=bool)
@@ -369,9 +593,8 @@ class EVcouplings(BaseModel, Scorer, MutationScorer, ConditionalMutationScorer):
         self.ready_or_raise()
         self._validate_instances([instance])
 
-        # only entity 0 is modelled by EVcouplings
-        if entity is not None and entity != 0:
-            raise ValueError("EVcouplings only models entity 0")
+        if entity is not None and entity not in self._modelled_entities:
+            raise ValueError(f"EVcouplings does not model entity {entity}")
 
         if positions is not None:
             if entity is None:
@@ -383,7 +606,6 @@ class EVcouplings(BaseModel, Scorer, MutationScorer, ConditionalMutationScorer):
         status_start(status_callback, "Computing single mutation scan")
 
         model = self.model
-        first_index = self.system[0].first_index
 
         # map the instance onto the integer background over modelled positions
         bg, subseq, invalid = self._instance_background(instance)
@@ -391,8 +613,6 @@ class EVcouplings(BaseModel, Scorer, MutationScorer, ConditionalMutationScorer):
         # full L x num_symbols delta-Hamiltonian matrix relative to this background
         delta = _single_mutant_hamiltonians(bg, model.J_ij, model.h_i)[:, :, FULL]
 
-        # evedesign positions aligned with the model array order
-        evc_positions = self._index_list - 1 + first_index
         pos_filter = set(positions) if positions is not None else None
 
         # columns of delta are in model alphabet order
@@ -401,11 +621,13 @@ class EVcouplings(BaseModel, Scorer, MutationScorer, ConditionalMutationScorer):
         rows = []
         index_tuples = []
         for i in range(model.L):
-            evc_pos = int(evc_positions[i])
+            evc_entity, evc_pos = self._model_position_map[i]
+            if entity is not None and evc_entity != entity:
+                continue
             if pos_filter is not None and evc_pos not in pos_filter:
                 continue
             rows.append(delta[i])
-            index_tuples.append((0, evc_pos, str(subseq[i])))
+            index_tuples.append((evc_entity, evc_pos, str(subseq[i])))
 
         df = pd.DataFrame(
             rows,
@@ -416,11 +638,12 @@ class EVcouplings(BaseModel, Scorer, MutationScorer, ConditionalMutationScorer):
         )
 
         # reorder/select columns into the evedesign alphabet
+        alphabet_entities = [entity] if entity is not None else self._modelled_entities
         merged_alphabet = Entity.merge_alphabet_symbols([
-            self.system[0].alphabet(
+            self.system[entity_idx].alphabet(
                 include_gap=self.handles_deletions,
                 include_inserts=self.handles_insertions,
-            )
+            ) for entity_idx in alphabet_entities
         ])
         df = df.reindex(merged_alphabet, axis=1)
 
@@ -451,7 +674,7 @@ class EVcouplings(BaseModel, Scorer, MutationScorer, ConditionalMutationScorer):
 
         self._validate_instances(instances)
 
-        # validate entity/position per instance (entity must be 0, position must be modelled)
+        # validate entity/position per instance
         for instance, entity, pos in zip(instances, entities, positions):
             self.valid_positions(
                 positions=[pos], instance=instance, entities=[entity], raise_invalid=True
@@ -460,12 +683,7 @@ class EVcouplings(BaseModel, Scorer, MutationScorer, ConditionalMutationScorer):
         status_start(status_callback, "Computing conditional scores")
 
         model = self.model
-        first_index = self.system[0].first_index
         num_symbols = model.num_symbols
-
-        # evedesign position -> model array index
-        evc_positions = self._index_list - 1 + first_index
-        pos_to_mi = {int(p): i for i, p in enumerate(evc_positions)}
 
         model_alphabet = list(model.alphabet)
 
@@ -473,7 +691,7 @@ class EVcouplings(BaseModel, Scorer, MutationScorer, ConditionalMutationScorer):
         index_tuples = []
         for inst_idx, (instance, entity, pos) in enumerate(zip(instances, entities, positions)):
             bg, _, invalid = self._instance_background(instance)
-            mi = pos_to_mi[int(pos)]
+            mi = self._entity_pos_to_model[(int(entity), int(pos))]
 
             bg_invalid = invalid.copy()
             bg_invalid[mi] = False
@@ -647,8 +865,9 @@ class EVcouplingsPLM(EVcouplings):
     ) -> "CouplingsModel":
         # scale lambda_J as in the standard couplings protocol
         lambda_J = self.lambda_J
+        alphabet = self._alphabet or ALPHABET_PROTEIN
         if self.lambda_J_times_Lq:
-            num_symbols = len(ALPHABET_PROTEIN) - (1 if self.ignore_gaps else 0)
+            num_symbols = len(alphabet) - (1 if self.ignore_gaps else 0)
             lambda_J = lambda_J * (num_symbols - 1) * (num_model_positions - 1)
 
         iterations = 1 if self.independent_model else self.iterations
@@ -678,8 +897,7 @@ class EVcouplingsPLM(EVcouplings):
                     str(couplings_file),
                     param_file=str(param_file),
                     focus_seq=focus_id,
-                    # None -> plmc default protein alphabet (gap included)
-                    alphabet=None,
+                    alphabet=alphabet,
                     theta=self.theta if weights is None else None,
                     scale=self.scale_clusters,
                     ignore_gaps=self.ignore_gaps,
