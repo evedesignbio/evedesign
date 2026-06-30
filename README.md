@@ -51,6 +51,31 @@ with BoltzGen or BindCraft.
 We are actively looking for further contributors to develop our framework jointly with the community. 
 If you are interested or feel like an important model is missing from the framework, please get in contact with us!
 
+### Development setup
+
+Contributions should target the `develop` branch. To set up a local environment:
+
+```bash
+python -m venv .venv
+source .venv/bin/activate   # Windows: .venv\Scripts\activate
+python -m pip install --upgrade pip
+python -m pip install -e .
+python -m pip install pytest build
+```
+
+Run the test suite and verify the package builds:
+
+```bash
+pytest tests/
+python -m build
+```
+
+CI runs these checks on pull requests using core dependencies only. Optional model extras (`evmutation2`, `esm2`, `mpnn`, etc.) are not installed in CI because they pull in heavier ML dependencies such as PyTorch.
+
+### Releasing
+
+Tagged releases (`v*`) trigger the release workflow, which builds and publishes to PyPI. Maintainers must configure [PyPI trusted publishing](https://docs.pypi.org/trusted-publishers/) for this repository before the first automated release.
+
 ## License
 
 *evedesign* is released under the MIT license.
