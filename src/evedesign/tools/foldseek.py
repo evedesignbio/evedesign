@@ -9,7 +9,7 @@ from evedesign.tools.api_utils import _request_with_retries
 from evedesign.system import System
 from evedesign.structure import StructureFile, Structure
 from evedesign.constants import GAP
-from evedesign.__about__ import __version__
+from evedesign import __version__
 
 AFDB_DOWNLOAD_URL = "https://alphafold.ebi.ac.uk/files/{id_}.cif"
 

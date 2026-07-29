@@ -45,11 +45,18 @@ EvaluationScoreName = Literal[
 ]
 
 class ModelStats(TypedDict):
-    y_true: NotRequired[np.ndarray]
-    y_pred: NotRequired[np.ndarray]
+    y_true: NotRequired[Sequence[Sequence[float]]]
+    y_pred: NotRequired[Sequence[Sequence[float]]]
 
     # different types of evaluation scores
     scores: NotRequired[dict[EvaluationScoreName, np.ndarray]]
+
+class DatasetSplit(TypedDict):
+    train: Sequence[int]
+    test: NotRequired[Sequence[int]]
+    val: NotRequired[Sequence[int]]
+
+DatasetSplitMap = dict[str, DatasetSplit]
 
 # status, progress (optional), message (optional)
 Status = Literal["running", "done", "failed"]

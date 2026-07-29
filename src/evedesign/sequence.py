@@ -5,12 +5,74 @@ from string import ascii_lowercase
 from typing import Any, Literal, Self, TextIO
 from pathlib import Path
 from collections import abc
-from evedesign.constants import MASK, GAP
+
+import numpy as np
+from numba import jit, prange, get_num_threads, set_num_threads
+
+from evedesign.constants import (
+    MASK,
+    GAP,
+    VALID_AA_OR_GAP_SORTED,
+    VALID_DNA_OR_GAP_SORTED,
+    VALID_RNA_OR_GAP_SORTED,
+)
 from evedesign.types import BioPolymer, RepSequence, SequenceMetadata
-from evedesign.utils import shorten
+from evedesign.utils import shorten, str_to_np_char_view, map_array, index_map
 
 
 REMOVE_INSERTIONS_TRANSLATION = str.maketrans("", "", ascii_lowercase + ".")
+
+ALPHABETS_OR_GAP_SORTED: dict[str, list[str]] = {
+    "protein": VALID_AA_OR_GAP_SORTED,
+    "dna": VALID_DNA_OR_GAP_SORTED,
+    "rna": VALID_RNA_OR_GAP_SORTED,
+}
+
+
+@jit(nopython=True, parallel=True)
+def _num_cluster_members(matrix, identity_threshold, exclude_value):
+    """
+    Calculate number of sequences in alignment
+    within given identity_threshold of each other
+
+    Parameters
+    ----------
+    matrix : np.array
+        N x L matrix containing N sequences of length L.
+        Matrix must be mapped to range(0, num_symbols) using
+        map_matrix function
+    identity_threshold : float
+        Sequences with at least this pairwise identity will be
+        grouped in the same cluster.
+    exclude_value : int
+        Value >= 0 in matrix that will be excluded from identity calculation, e.g. gap or lowercase character.
+        Set to -1 to enable legacy behaviour which includes gaps in identity calculation.
+
+    Returns
+    -------
+    np.array
+        Vector of length N containing number of cluster
+        members for each sequence (inverse of sequence
+        weight)
+    """
+    N, L = matrix.shape
+    num_neighbors = np.zeros((N, ))
+    L_seq = np.sum(matrix != exclude_value, axis=1)
+
+    for i in prange(N):
+        num_neighbors_i = 1 
+        for j in range(N):
+            if i == j:
+                continue
+            matches = 0
+            for k in range(L):
+                if matrix[i, k] == matrix[j, k] and matrix[i, k] != exclude_value:
+                    matches += 1
+            if matches / L_seq[i] >= identity_threshold:
+                num_neighbors_i += 1
+        num_neighbors[i] = num_neighbors_i
+
+    return num_neighbors
 
 
 class Sequence:
@@ -209,7 +271,202 @@ class Sequences:
             aligned=True,
             weights=self.weights,
             format=self.format_
-        )        
+        )
+
+    def compute_weights(
+        self,
+        theta: float = 0.8,
+        method: Literal["theta_nogaps", "theta_withgaps"] = "theta_nogaps",
+        cpu: int | None = None,
+    ) -> Self:
+        """
+        Compute per-sequence weights and return a copy with the weights set
+
+        Does not mutate the current object. The returned Sequences shares the same
+        underlying Sequence objects with weights replaced
+
+        Parameters
+        ----------
+        theta
+            Sequence identity threshold for clustering
+        method
+            theta_nogaps excludes gaps from identity calculation,
+            theta_withgaps includes them 
+        cpu
+            Number of numba threads (None uses all)
+
+        Returns
+        -------
+        A copy of this Sequences object with weights set
+        """
+        match_seqs = [s.seq for s in self.to_a3m().remove_inserts().seqs]
+
+        alphabet = ALPHABETS_OR_GAP_SORTED.get(
+            self.type_, ALPHABETS_OR_GAP_SORTED["protein"]
+        )
+        mapping = index_map(list(alphabet), default_option=GAP)
+        matrix = map_array(str_to_np_char_view(match_seqs), mapping)
+
+        exclude_value = mapping[GAP] if method == "theta_nogaps" else -1
+
+        threads_before = None
+        if cpu is not None:
+            threads_before = get_num_threads()
+            set_num_threads(cpu)
+        try:
+            num_cluster_members = _num_cluster_members(matrix, theta, exclude_value)
+        finally:
+            if threads_before is not None:
+                set_num_threads(threads_before)
+
+        weights = [float(w) for w in 1.0 / num_cluster_members]
+
+        return type(self)(
+            seqs=self.seqs,
+            aligned=self.aligned,
+            type=self.type_,
+            weights=weights,
+            format=self.format_,
+        )
+
+    def remap_query(
+        self,
+        old_query: str | RepSequence,
+        new_query: str | RepSequence,
+        prepend_new_query: bool = True,
+    ) -> "Sequences":
+        """
+        Remap this alignment to a new query sequence.
+
+        Returns a new Sequences with the same hits but with columns added/removed
+        to match the new query's insertions and deletions relative to the old query.
+
+        Used to reuse one MSA across many SystemInstances without re-querying the
+        MMSeqs2 server: search once on the system rep, remap per-instance.
+
+        Parameters
+        ----------
+        old_query
+            The query that produced the current alignment (the system rep or
+            whatever was used to populate self).
+        new_query
+            The new query in A3M convention: uppercase for alignment columns,
+            '-' for deletions, lowercase for insertions.
+        prepend_new_query
+            If True (default), the new query is inserted as the first sequence
+            of the returned alignment. Most tools expect the query in the first
+            position by convention, so this saves callers from prepending it
+            themselves. The query is stored in ungapped, uppercase form (gaps
+            removed, insertions uppercased) — i.e. the actual designed residues.
+
+        Returns
+        -------
+        Sequences
+            A new Sequences containing the same hits with columns remapped,
+            optionally with the new query as the first sequence.
+            Format is preserved.
+
+        Raises
+        ------
+        NotImplementedError
+            If self.format_ is not in {"a3m", "a2m"}.
+        ValueError
+            If new_query's match-column count (uppercase + gap chars) doesn't
+            match old_query's match-column count.
+        ValueError
+            If any hit's match-column count (non-lowercase chars) doesn't match
+            old_query's match-column count.
+        """
+        if self.format_ not in {"a3m", "a2m"}:
+            raise NotImplementedError(
+                f"remap_query is not supported for format: {self.format_}"
+            )
+
+        # accept both str and RepSequence (numpy U1 array)
+        old_q = "".join(old_query)
+        new_q = "".join(new_query)
+
+        # match columns = uppercase (aligned) or gap; lowercase = insert (0 cols)
+        def match_columns(s: str) -> int:
+            return sum(1 for ch in s if not ch.islower())
+
+        n_cols = match_columns(old_q)
+
+        if match_columns(new_q) != n_cols:
+            raise ValueError(
+                f"new_query spans {match_columns(new_q)} match columns "
+                f"but old_query has {n_cols}"
+            )
+
+        for hit in self.seqs:
+            hit_cols = match_columns(hit.seq)
+            if hit_cols != n_cols:
+                raise ValueError(
+                    f"hit '{hit.id_}' has {hit_cols} match columns, "
+                    f"expected {n_cols} to match old_query"
+                )
+
+        def consume_match_column(hit_str: str, pos: int) -> tuple[str, str, int]:
+            # carry any leading lowercase insert run, then take one match char
+            start = pos
+            while pos < len(hit_str) and hit_str[pos].islower():
+                pos += 1
+            insert_run = hit_str[start:pos]
+            if pos >= len(hit_str):
+                raise ValueError("hit has fewer match columns than old_query")
+            return insert_run, hit_str[pos], pos + 1
+
+        remapped = []
+        for hit in self.seqs:
+            hit_str = hit.seq
+            out: list[str] = []
+            p = 0
+            for c in new_q:
+                if c.islower():
+                    # new-query insertion: hits have no residue here
+                    out.append(GAP)
+                elif c == GAP:
+                    # deletion: keep the hit's insert run, drop the match residue
+                    insert_run, _col, p = consume_match_column(hit_str, p)
+                    out.append(insert_run)
+                else:
+                    # substitution/match: carry insert run + residue
+                    insert_run, col, p = consume_match_column(hit_str, p)
+                    out.append(insert_run)
+                    out.append(col)
+
+            # carry any trailing (C-terminal) insert run
+            while p < len(hit_str) and hit_str[p].islower():
+                out.append(hit_str[p])
+                p += 1
+
+            if p != len(hit_str):
+                raise ValueError(
+                    f"hit '{hit.id_}' has more match columns than old_query"
+                )
+
+            remapped.append(
+                type(hit)(
+                    seq="".join(out), id=hit.id_, key=hit.key,
+                    type=hit.type_, metadata=hit.metadata,
+                )
+            )
+
+        if prepend_new_query:
+            # Store the query as the actual designed residues: gaps (deletions)
+            # dropped and insertions uppercased, matching the match columns the
+            # remapped hits are now aligned to.
+            query_residues = new_q.replace(GAP, "").upper()
+            seq_cls = type(remapped[0]) if remapped else Sequence
+            query_type = remapped[0].type_ if remapped else "protein"
+            remapped.insert(0, seq_cls(seq=query_residues, type=query_type))
+
+        return type(self)(
+            seqs=remapped,
+            aligned=True,
+            weights=self.weights,
+            format=self.format_,
+        )
 
     def serialize(self) -> dict[str, Any]:
         """

@@ -4,11 +4,10 @@ from tempfile import NamedTemporaryFile
 from typing import Sequence, Self, Literal
 import urllib.request
 
-import numpy as np
 from loguru import logger
 
 from evedesign.model import (
-    BaseModel, Scorer, Generator, MutationScorer, ConditionalMutationScorer
+    BaseModel, Scorer, Generator, MutationScorer, ConditionalMutationScorer, assign_scores_to_instances
 )
 from evedesign.system import System, SystemInstance
 from evedesign.structure import Structure
@@ -32,7 +31,7 @@ except ImportError:
     IMPORT_AVAILABLE = False
 
 MODEL_BASE_URL = "https://files.ipd.uw.edu/pub/ligandmpnn"
-DEFAULT_CHECKPOINT_PATH = os.path.expanduser("~/.cache/mpnn")
+DEFAULT_CACHE_DIR = os.path.expanduser("~/.cache/mpnn")
 
 # Model checkpoint URLs
 MODEL_URLS = {
@@ -136,7 +135,7 @@ class LigandMPNN(BaseModel, Scorer, Generator, MutationScorer, ConditionalMutati
         fix_full_decoding_order: bool = False,
         vary_decoding_order_per_instance: bool = False,
         keep_model_after_build: bool = False,
-        cache_dir: str | None = DEFAULT_CHECKPOINT_PATH,
+        model_dir_path: str | None = DEFAULT_CACHE_DIR,
         device: DeviceType = "cpu"
     ):
         """
@@ -164,8 +163,8 @@ class LigandMPNN(BaseModel, Scorer, Generator, MutationScorer, ConditionalMutati
             (will only have an effect if fix_full_decoding_order is False)
         ligand_cutoff
             Cutoff distance in angstroms to select residues that are considered to be close to ligand atoms
-        cache_dir
-            Directory to use for storing downloaded model parameters (only relevant if checkpoint_path is None)
+        model_dir_path
+            Directory to use for storing downloaded model parameters (only relevant if model_file_path is None)
         device
             Device to use for computations
         """
@@ -192,7 +191,7 @@ class LigandMPNN(BaseModel, Scorer, Generator, MutationScorer, ConditionalMutati
        # Handle checkpoint path
         if model_file_path is None:
             # Download from web using model_name
-            self.checkpoint_path = download_checkpoint(model_name, cache_dir)
+            self.checkpoint_path = download_checkpoint(model_name, model_dir_path)
         else:
             self.checkpoint_path = model_file_path
 
@@ -562,26 +561,26 @@ class LigandMPNN(BaseModel, Scorer, Generator, MutationScorer, ConditionalMutati
             system_instances.append(system_instance)
 
         # score the generated instances
-        scores = self.score(system_instances, status_callback=status_callback)
+        scored_instances = self.score(system_instances, status_callback=status_callback)
 
         # try to score target sequence as well
         target_instance = self._system.rep_to_instance()
         if self._validate_instances([target_instance], raise_invalid=False):
-            target_score = self.score([target_instance])[0]
+            target_score = self.score([target_instance])[0].score
         else:
             target_score = 0.0
 
-        # attach scores to instances
-        for instance, raw_score in zip(system_instances, scores):
-             instance.score = raw_score - target_score
+        # attach scores to instances; keep confidence as-is
+        for instance in scored_instances:
+            instance.score -= target_score
 
-        return system_instances
+        return scored_instances
 
     def score(
         self,
         instances: Sequence[SystemInstance],
         status_callback: StatusCallback | None = None
-    ) -> np.ndarray:
+    ) -> list[SystemInstance]:
         self.ready_or_raise()
         self._validate_instances(instances)
 
@@ -654,5 +653,5 @@ class LigandMPNN(BaseModel, Scorer, Generator, MutationScorer, ConditionalMutati
                     # Convert to positive log likelihood
                     scores.append(-loss.item())
 
-        # 5. Return as numpy array
-        return np.array(scores)
+        # 5. Attach scores to instances
+        return assign_scores_to_instances(instances, scores)

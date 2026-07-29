@@ -281,7 +281,7 @@ class Scorer(_Core):
         self,
         instances: Sequence[SystemInstance],
         status_callback: StatusCallback | None = None
-    ) -> np.ndarray[tuple[int], np.dtype[float]]:
+    ) -> list[SystemInstance]:
         """
         Score different realizations of the modelled system (e.g. different sequences
         generated from a model)
@@ -295,6 +295,10 @@ class Scorer(_Core):
          and to extract all information needed (e.g. deletions marked by GAP for models handling deletions,
          insertions marked with lowercase symbols for models handling insertions, etc.)
 
+        3. Implementation must not mutate the provided instance list (references to embeddings and structures
+          can be reused for efficiency when copying, i.e. a shallow copy of SystemInstance and EntityInstance objects
+          as provided by SystemInstance.copy() is sufficient)
+
         Parameters
         ----------
         instances
@@ -304,9 +308,59 @@ class Scorer(_Core):
 
         Returns
         -------
-        Vector of scores (one per instance, in same order as instances input parameter)
+        Scored instances (copy, not modified in place), with updated score attribute (and confidence
+        attribute where applicable), in same order as input instances
         """
         pass
+
+
+def assign_scores_to_instances(
+    instances: Sequence[SystemInstance],
+    scores: Sequence[float],
+    confidences: Sequence[float] | None = None,
+):
+    """
+    Helper function to assign a sequence of scores to a sequence of instances, creating
+    a shallow copy of each instance and its entities. All sequences must have the same length.
+
+    The confidence attribute will be set to the corresponding value in confidences if provided
+
+    Parameters
+    ----------
+    instances
+        Sequence of instances to which scores will be assigned
+    scores
+        Sequence of scores to assign, must have same length as instances
+    confidences
+        Optional sequence of values to assign to the confidence attribute of each instance.
+        If None (default), the confidence attribute is set to None. If provided, must have same length
+        as instances.
+
+    Returns
+    -------
+    scored_instances
+        Sequence of instances with assigned scores (and confidences if applicable)
+    """
+    if len(scores) != len(instances):
+        raise ValueError(
+            "Length of scores does not match length of instances"
+        )
+
+    if confidences is not None and len(confidences) != len(instances):
+        raise ValueError(
+            "Length of confidences does not match length of instances"
+        )
+
+    # create shallow copy of instances
+    instances_scored = [
+        inst.copy() for inst in instances
+    ]
+
+    for idx, (inst, score) in enumerate(zip(instances_scored, scores)):
+        inst.score = score
+        inst.confidence = confidences[idx] if confidences is not None else None
+
+    return instances_scored
 
 
 class ConditionalMutationScorer(_Core, ABC):
@@ -434,7 +488,9 @@ class ConditionalMutationScorer(_Core, ABC):
 
         # pass through scoring method (note we could also use score_mutants per instance above
         # if MutationScorer interface implemented but for now default to this simpler solution)
-        scores = self.score(all_instances, status_callback)
+        scores = np.array([
+            inst.score for inst in self.score(all_instances, status_callback)
+        ])
 
         merged_alphabet = Entity.merge_alphabet_symbols([
             self.system[entity_idx].alphabet(
@@ -560,9 +616,11 @@ class MutationScorer(_Core, ABC):
         # compute scores through score_mutants - might already be a more efficient custom implementation
         # than score() (which itself can fallback on score() if not implemented); note these
         # scores will already be normalized to target so no need to normalize here
-        scores = self.score_mutants(
-            instance, mutants, status_callback
-        )
+        scores = np.array([
+            inst.score for inst in self.score_mutants(
+                instance, mutants, status_callback
+            )
+        ])
 
         # build into dataframe and return
         series = pd.Series(scores)
@@ -591,7 +649,7 @@ class MutationScorer(_Core, ABC):
         instance: SystemInstance,
         mutants: Sequence[Mutant],
         status_callback: StatusCallback | None = None
-    ) -> np.ndarray[tuple[int], np.dtype[float]]:
+    ) -> list[SystemInstance]:
         """
         Compute logit scores for a list of mutations to a specified system instance
         (can be any single or higher-order mutants); this method is to allow specialized, more efficient
@@ -620,7 +678,8 @@ class MutationScorer(_Core, ABC):
 
         Returns
         -------
-        1D array of scores, guaranteed to be in the same order as mutants list
+        Scored mutant instances derived from mutant list, with set score attribute (and confidence attribute
+        where applicable), guaranteed to be in the same order as mutants list
         """
         if not isinstance(self, Scorer):
             raise NotImplementedError(
@@ -643,15 +702,20 @@ class MutationScorer(_Core, ABC):
         )
 
         # create mutants, add target to compute score for relative normalization
-        instances = [instance] + self.system.mutate(instance, mutants)
+        instances = [instance.copy()] + self.system.mutate(instance, mutants)
 
         # score instances
-        scores = self.score(instances, status_callback)
+        scored_instances = self.score(instances, status_callback)
 
-        # normalize scores to target instance, remove target from list
-        scores_norm = scores[1:] - scores[0]
+        # normalize scores to target instance, mutate copies from above in place;
+        # keep confidence scores as they are (if confidence values need to be modified, need
+        # to overwrite this method with a specialized implementation)
+        ref_score = scored_instances[0].score
+        norm_instances = scored_instances[1:]
+        for inst in norm_instances:
+            inst.score -= ref_score
 
-        return scores_norm
+        return norm_instances
 
 
 class Transformer(_Core):
@@ -659,21 +723,20 @@ class Transformer(_Core):
     Interface implemented by models that transform instances from one representation to another
     (e.g. from sequence to embeddings or structures, or vice versa).
 
-    Note: Implementations may transform to any representation attribute present on SystemInstance
+    Note:
+    1. Implementations may transform to any representation attribute present on SystemInstance
      (rep, embedding, structure)
 
-    Note: Implementations must verify that all relevant input attributes on instances are specified
+    2. Implementations must verify that all relevant input attributes on instances are specified
 
-    Note: implementations should also set the "score" attribute on the SystemInstance to simultaneously
+    3. implementations should also set the "score" attribute on the SystemInstance to simultaneously
      score and transform instances for increased computational efficiency (e.g. compute likelihood
-     score and embed) if it is able to compute both at the same time
+     score and embed) if it is able to compute both at the same time. The same applies for the "confidence"
+     attribute where applicable.
 
-    Note: Implementation must not mutate the provided instance list (references to embeddings and structures
+    4. Implementation must not mutate the provided instance list (references to embeddings and structures
      can be reused for efficiency when copying, i.e. a shallow copy of SystemInstance and EntityInstance objects
-     is sufficient)
-
-    TODO: eventually revisit if beneficial to add specialized methods for single-mutant embeddings
-     (like for scoring)
+     as provided by SystemInstance.copy() is sufficient)
     """
     @abstractmethod
     def transform(
@@ -1083,7 +1146,7 @@ def system_subset_model(model_class):
             self,
             instances: Sequence[SystemInstance],
             status_callback: StatusCallback | None = None
-        ) -> np.ndarray[tuple[int], np.dtype[float]]:
+        ) -> list[SystemInstance]:
             self.ready_or_raise()
             self._validate_instances(instances)
 
@@ -1091,9 +1154,21 @@ def system_subset_model(model_class):
                 self._filter_instance(instance) for instance in instances
             ]
 
-            return self.model.score(
+            # apply scoring to filtered instances
+            instances_filt_scored = self.model.score(
                 instances_filt, status_callback
             )
+
+            # copy original instances and assign scores/confidences from filtered instances
+            instances_full = [
+                inst.copy() for inst in instances
+            ]
+
+            for idx, inst in instances_full:
+                instances_full[idx].score = instances_filt_scored[idx].score
+                instances_full[idx].confidence = instances_filt_scored[idx].confidence
+
+            return instances_full
 
         def score_conditional(
             self,
@@ -1166,7 +1241,7 @@ def system_subset_model(model_class):
             instance: SystemInstance,
             mutants: Sequence[Mutant],
             status_callback: StatusCallback | None = None
-        ) -> np.ndarray[tuple[int], np.dtype[float]]:
+        ) -> list[SystemInstance]:
             self.ready_or_raise()
             self._validate_instances([instance])
 
@@ -1182,9 +1257,19 @@ def system_subset_model(model_class):
 
             instance_filt = self._filter_instance(instance)
 
-            return self.model.score_mutants(
+            instances_filt_scored = self.model.score_mutants(
                 instance_filt, mutants_mapped, status_callback
             )
+
+            # create full mutated instances and assign scores/confidences from filtered instances
+            instances_full = self.system.mutate(instance, mutants)
+            assert len(instances_full) == len(instances_filt_scored), "Instance list length mismatch"
+
+            for inst_full, inst_filt in zip(instances_full, instances_filt_scored):
+                inst_full.score = inst_filt.score
+                inst_full.confidence = inst_filt.confidence
+
+            return instances_full
 
         def transform(
             self,

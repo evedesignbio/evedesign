@@ -26,14 +26,39 @@ framework. bioRxiv (2026) doi:10.64898/2026.03.17.712115](https://www.biorxiv.or
 ## Installation
 
 Use the following command to install *evedesign* with support for all currently implemented models.
-You can remove any of the options if you do not need the respective model.
+You can remove any of the options if you do not need the respective model. Please see specific instructions for Boltz-2 further below.
 ```
-pip install evedesign[evmutation2,esm2,mpnn,umap] 
+pip install evedesign[evmutation2,esm2,mpnn,umap,gpytorch] 
 ```
+
+### Boltz2 installation 
+
+#### GPU-based (CUDA, recommended)
+
+For structure predictions with Boltz-2 and CUDA, install the `boltz2fold-cuda` extra with [uv](https://docs.astral.sh/uv/):
+```bash
+uv pip install evedesign[boltz2fold-cuda]
+```
+PyPI's default torch ships with CUDA support (tested on a CUDA 13
+build, which runs on CUDA 12.x+ drivers via forward compatibility).
+If you need a specific CUDA build to match an older driver, you might explore adding the
+matching PyTorch index, e.g.:
+```bash
+    uv pip install evedesign[boltz2fold-cuda] \
+        --extra-index-url https://download.pytorch.org/whl/cu126 \
+        --index-strategy unsafe-best-match
+```
+**uv is required** for this install path: boltz and its dependencies ship overly-conservative version pins that
+are overridden in `[tool.uv]` in `pyproject.toml`, and pip does not honor those overrides.
+
+#### CPU/MPS-based
+
+For CPU/MPS-only use (no CUDA), install the `boltz2fold` extra instead of `boltz2fold-cuda`.
 
 ## Getting started
 
-Please refer to some of our [examples](examples) how to use *evedesign*. We are planning to extend these further in the near future.
+Please refer to some of our [examples](examples) how to use *evedesign*. We are continuously extending these as new 
+models are added to the framework.
 
 To implement your own models in the framework, please have a look at our existing reference implementations 
 (e.g. [EVmutation2](src/evedesign/models/evmutation2.py), [ESM-2](src/evedesign/models/esm2.py), 
@@ -42,6 +67,50 @@ the underlying [model interfaces](src/evedesign/model.py) and
 [description of molecular systems and instances](src/evedesign/system.py).
 
 We are happy to help if you have any questions!
+
+## Currently available models and methods
+
+### Biomolecular models, embedders and restraints
+
+| Name                        | Class                                                  | Interfaces                           | 
+|-----------------------------|--------------------------------------------------------|--------------------------------------|
+| EVmutation2                 | `evedesign.models.evmutation2.EVmutation2`             | `Generator`, `Scorer`, `Transformer` |
+| LigandMPNN/ProteinMPNN      | `evedesign.models.mpnn.LigandMPNN`                     | `Generator`, `Scorer`                |
+| ESM-2                       | `evedesign.models.esm2.ESM2`                           | `Transformer` `Scorer`               |
+| Boltz-2                     | `evedesign.models.boltzfold.BoltzFoldTransformer`      | `Transformer`, `Scorer`              |
+| EVcouplings                 | `evedesign.models.evcouplings.EVcouplings`             | `Scorer`                             |
+| Sequence distance restraint | `evedesign.restraints.seq_dist.LinearSeqDistRestraint` | `Scorer`                             |
+| One-hot encoding embedder   | `evedesign.models.embedders.OneHotEmbedder`            | `Transformer`                        |
+| BLOSUM embedder             | `evedesign.models.embedders.BLOSUMEmbedder`            | `Transformer`                        |
+
+### Supervised models
+
+| Name                                | Class                                                            | Interfaces       | 
+|-------------------------------------|------------------------------------------------------------------|------------------|
+| Scikit-learn regressors/classifiers | `evedesign.models.supervised.SklearnPredictorOnEmbeddingsScores` | `Scorer`         |
+| Gaussian Process regression         | `evedesign.models.supervised.GpytorchModel`                      | `Scorer`         |
+
+### Samplers
+
+| Name          | Class                                  | Interfaces  | 
+|---------------|----------------------------------------|-------------|
+| Gibbs sampler |`evedesign.samplers.gibbs.GibbsSampler` | `Generator` |
+
+### Analyzers
+
+| Name                                   | Class                                                         | Interfaces   | 
+|----------------------------------------|---------------------------------------------------------------|--------------|
+| UMAP sequence space projection         | `evedesign.analyzers.sequence_space.SequenceSpaceUMAP`        | `Analyzer`   |
+| MDS sequence space projection          | `evedesign.analyzers.sequence_space.SequenceSpaceMDS`         | `Analyzer`   |
+| Landmark MDS sequence space projection | `evedesign.analyzers.sequence_space.SequenceSpaceLandmarkMDS` | `Analyzer`   |
+| PCA sequence space projection          | `evedesign.analyzers.sequence_space.SequenceSpacePCA`         | `Analyzer`   |
+
+### Nucleotide sequence generation
+
+| Name                          | Class                                      | Interfaces              | 
+|-------------------------------|--------------------------------------------|-------------------------|
+| DNA Chisel codon optimization | `evedesign.codons.DNAChiselCodonOptimizer` | `ProteinToDnaOptimizer` |
+
 
 ## Roadmap and contributing
 

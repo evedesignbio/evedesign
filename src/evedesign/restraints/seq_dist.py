@@ -5,7 +5,7 @@ from typing import Self, Sequence
 
 import numpy as np
 
-from evedesign.model import BaseModel, Scorer, ConditionalMutationScorer, MutationScorer
+from evedesign.model import BaseModel, Scorer, ConditionalMutationScorer, MutationScorer, assign_scores_to_instances
 from evedesign.system import Entity, System, SystemInstance
 from evedesign.types import StatusCallback
 from evedesign.utils import str_to_np_char_view, map_array
@@ -165,7 +165,7 @@ class LinearSeqDistRestraint(BaseModel, Scorer, MutationScorer, ConditionalMutat
         self,
         instances: Sequence[SystemInstance],
         status_callback: StatusCallback | None = None
-    ) -> np.ndarray[tuple[int], np.dtype[float]]:
+    ) -> list[SystemInstance]:
         self.ready_or_raise()
 
         # validate instance sequences with specific requirements for this class
@@ -194,8 +194,7 @@ class LinearSeqDistRestraint(BaseModel, Scorer, MutationScorer, ConditionalMutat
 
                 dists += diff.sum(axis=1)
 
-        assert len(dists) == len(instances)
-        return dists
+        return assign_scores_to_instances(instances, dists)
 
     # Note: following implementation breaks on latest pandas versions due to direct assignment to .values;
     #  but can now be replaced with the ConditionalScorer mixin for simplicity

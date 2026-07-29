@@ -1,0 +1,9 @@
+
+# Python caches
+__pycache__/
+*.py[cod]
+
+# Local run artifacts
+install.log
+scripts/
+examples/**/*.cif

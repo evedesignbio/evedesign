@@ -9,7 +9,7 @@ import numpy as np
 import pandas as pd
 
 from evedesign.model import (
-    BaseModel, Scorer, Generator, MutationScorer, ConditionalMutationScorer, Transformer
+    BaseModel, Scorer, Generator, MutationScorer, ConditionalMutationScorer, Transformer, assign_scores_to_instances
 )
 from evedesign.system import System, SystemInstance, EntityInstance, Mutant
 from evedesign.constants import MASK
@@ -417,21 +417,18 @@ class EVmutation2(BaseModel, Scorer, MutationScorer, ConditionalMutationScorer, 
             ) for rep in ref_and_designs
         ]
 
-        # score and attach to instances (normalize by reference score)
-        scores = self.score(instances)
-        ref_score = scores[0]
+        # score and attach to instances (normalize by reference score), confidences will be set to None in call
+        scored_ref_and_instances = self.score(instances)
+        ref_score = scored_ref_and_instances[0].score
 
-        # remove reference in first position again
-        instances_with_score = [
-            SystemInstance(
-                EntityInstance(rep=seq),
-                score=score - ref_score
-            ) for seq, score in zip(ref_and_designs, scores)
-        ][1:]
+        # remove reference from list, set normalized score in place
+        scored_instances = scored_ref_and_instances[1:]
+        for inst in scored_instances:
+            inst.score -= ref_score
 
-        assert len(instances_with_score) >= num_designs, "Not returning minimum guaranteed number of designs"
+        assert len(scored_instances) >= num_designs, "Not returning minimum guaranteed number of designs"
 
-        return instances_with_score
+        return scored_instances
 
     def _score_embed(
         self,
@@ -499,10 +496,14 @@ class EVmutation2(BaseModel, Scorer, MutationScorer, ConditionalMutationScorer, 
         self,
         instances: Sequence[SystemInstance],
         status_callback: StatusCallback | None = None,
-    ) -> np.ndarray[tuple[int], np.dtype[float]]:
-        return self._score_embed(
+    ) -> list[SystemInstance]:
+        scores, _ = self._score_embed(
             instances, status_callback, return_embeddings=False
-        )[0]
+        )
+
+        return assign_scores_to_instances(
+            instances, scores
+        )
 
     def transform(
         self,
@@ -528,6 +529,7 @@ class EVmutation2(BaseModel, Scorer, MutationScorer, ConditionalMutationScorer, 
 
         for i, inst in enumerate(instances_transformed):
             inst.score = scores[i]
+            inst.confidence = None
             inst[0].embedding = embeddings_agg[i]
 
         return instances_transformed
@@ -608,7 +610,7 @@ class EVmutation2(BaseModel, Scorer, MutationScorer, ConditionalMutationScorer, 
         effects.index.names = ["pos", "ref"]
 
         # add entity 0 to index
-        effects = pd.concat(
+        effects = pd.concat(  # noqa
             {entity: effects}, names=["entity"]
         )
 
@@ -624,7 +626,7 @@ class EVmutation2(BaseModel, Scorer, MutationScorer, ConditionalMutationScorer, 
         instance: SystemInstance,
         mutants: Sequence[Mutant],
         status_callback: StatusCallback | None = None
-    ) -> np.ndarray[tuple[int], np.dtype[float]]:
+    ) -> list[SystemInstance]:
         self.ready_or_raise()
 
         # check instance against molecular system, requiring fixed length of sequence
@@ -687,8 +689,15 @@ class EVmutation2(BaseModel, Scorer, MutationScorer, ConditionalMutationScorer, 
                 level=["mutant", "mutant_repeat"], sort=False
             ).mean()
 
-        # return as simple 1D numpy array
-        return effects_merged.score.values
+        # create mutant instances and add scores/confidence in place
+        instances_scored = self.system.mutate(instance, mutants)
+
+        assert len(instances_scored) == len(effects_merged.score.values)
+        for inst, score in zip(instances_scored, effects_merged.score.values):
+            inst.score = score
+            inst.confidence = None
+
+        return instances_scored
 
     def score_conditional(
         self,
@@ -745,7 +754,7 @@ class EVmutation2(BaseModel, Scorer, MutationScorer, ConditionalMutationScorer, 
         conditionals.index.names = ["instance", "pos"]
 
         # add entity 0 to index, then move instance index to outermost level
-        conditionals = pd.concat(
+        conditionals = pd.concat(  # noqa
             {0: conditionals}, names=["entity"]
         ).swaplevel(
             i=0, j=1, axis=0

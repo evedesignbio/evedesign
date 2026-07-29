@@ -537,7 +537,9 @@ class GibbsSampler(Generator):
                 scorer_name = type(scorer).__name__
 
                 # score instances with current model
-                scores_with_ref = scorer.score(instances_with_ref)
+                scores_with_ref = np.array([
+                    inst.score for inst in scorer.score(instances_with_ref)
+                ])
 
                 # normalize scores to target if possible, otherwise take as is
                 if ref_instance is not None:

@@ -1,10 +1,10 @@
 [build-system]
-requires = ["hatchling"]
-build-backend = "hatchling.build"
+requires = ["uv_build>=0.11.22,<0.12.0"]
+build-backend = "uv_build"
 
 [project]
 name = "evedesign"
-dynamic = ["version"]
+version = "0.0.5"
 description = ''
 readme = "README.md"
 requires-python = ">=3.12"
@@ -12,6 +12,8 @@ license = "MIT"
 keywords = []
 authors = [
   { name = "Thomas Hopf", email = "thomas.hopf@gmail.com" },
+  { name = "Khaoula Belahsen", email = "khbelahsensaf@gmail.com" },
+
 ]
 classifiers = [
   "Development Status :: 4 - Beta",
@@ -23,37 +25,53 @@ classifiers = [
   "Programming Language :: Python :: Implementation :: PyPy",
 ]
 dependencies = [
-  "numpy", "pandas", "loguru", "biotite", "biopython", "dnachisel", "scikit-learn", "numba", "scipy"
+  "numpy", "pandas", "loguru", "biotite", "biopython", "dnachisel", "scikit-learn", "numba", "scipy", "requests"
 ]
 
 [project.optional-dependencies]
 evmutation2 = ["torch", "evmutation2"]
+evcouplings = ["evcouplings"]
 esm2 = ["torch", "transformers"]
 mpnn = ["torch", "prody"]
+# boltz2fold: CPU/MPS install (default).
+# boltz2fold-cuda: adds boltz's [cuda] extra, which pulls
+# cuequivariance_ops_cu12, cuequivariance_ops_torch_cu12, and
+# cuequivariance_torch (all >=0.5.0). The cu12 ops wheels are built
+# for CUDA 12 and require a CUDA 12 toolkit/driver plus a
+# CUDA-enabled torch build (verified on CUDA 12.8); not usable on
+# CPU-only or macOS.
+boltz2fold = ["torch", "boltz>=2.2", "pyyaml"]
+boltz2fold-cuda = ["torch", "boltz[cuda]>=2.2; sys_platform == 'linux'", "pyyaml"]
 umap = ["umap-learn"]
+gpytorch = ["torch", "gpytorch"]
+notebooks = ["py3Dmol"]
 
 [project.urls]
 Documentation = "https://github.com/evedesignbio/evedesign#readme"
 Issues = "https://github.com/evedesignbio/evedesign/issues"
 Source = "https://github.com/evedesignbio/evedesign"
 
-[tool.hatch.version]
-path = "src/evedesign/__about__.py"
-
-[tool.hatch.envs.types]
-extra-dependencies = [
-  "mypy>=1.0.0",
+[dependency-groups]
+dev = [
+    "pytest>=8.0.0",
+    "pytest-cov>=5.0.0",
+    "mypy>=1.0.0",
 ]
-[tool.hatch.envs.types.scripts]
-check = "mypy --install-types --non-interactive {args:src/evedesign tests}"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "slow: marks tests as slow-running",
+    "boltz2fold: tests requiring the boltz2fold extra (torch, boltz, pyyaml)",
+    "esm2: tests requiring the esm2 extra (torch, transformers)",
+    "evcouplings: tests requiring the evcouplings extra",
+    "mpnn: tests requiring the mpnn extra (torch, prody)",
+]
 
 [tool.coverage.run]
 source_pkgs = ["evedesign", "tests"]
 branch = true
 parallel = true
-omit = [
-  "src/evedesign/__about__.py",
-]
 
 [tool.coverage.paths]
 evedesign = ["src/evedesign", "*/evedesign/src/evedesign"]
@@ -65,3 +83,7 @@ exclude_lines = [
   "if __name__ == .__main__.:",
   "if TYPE_CHECKING:",
 ]
+
+[tool.uv]
+override-dependencies = [
+    { package = { name = "boltz" }, dependencies = ["numpy>=2.0", "scipy>=1.14", "numba>=0.64"] },]
