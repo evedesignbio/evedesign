@@ -29,6 +29,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+eve = ["torch", "tqdm"]
 evmutation2 = ["torch", "evmutation2"]
 evcouplings = ["evcouplings"]
 esm2 = ["torch", "transformers"]
@@ -65,6 +66,7 @@ testpaths = ["tests"]
 markers = [
     "slow: marks tests as slow-running",
     "boltz2fold: tests requiring the boltz2fold extra (torch, boltz, pyyaml)",
+    "eve: tests requiring the eve extra (torch, tqdm)",
     "esm2: tests requiring the esm2 extra (torch, transformers)",
     "evcouplings: tests requiring the evcouplings extra",
     "mpnn: tests requiring the mpnn extra (torch, prody)",
