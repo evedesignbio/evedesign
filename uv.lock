@@ -20,6 +20,20 @@ resolution-markers = [
 overrides = [{ package = { name = "boltz" }, dependencies = [{ name = "numpy", specifier = ">=2.0" }, { name = "scipy", specifier = ">=1.14" }, { name = "numba", specifier = ">=0.64" }, { name = "biopython", specifier = ">=1.85" }] }]
 
 [[package]]
+name = "abnumber"
+version = "0.4.4"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "anarcii" },
+    { name = "biopython" },
+    { name = "pandas" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/eb/a8/a1881776938806d52e31d39b6d5e4d8780af5586c3bed01e664a694bd42e/abnumber-0.4.4.tar.gz", hash = "sha256:4c5fd9d33087dea23088bd2de08937aa66a561f2fd34cd420ce48e16512a0131", size = 37751, upload-time = "2025-05-19T15:12:16.049Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/50/ce/b1d59036791e26eb20e17704500b2cbf04abadf46a5bff95ad92e524f7c9/abnumber-0.4.4-py3-none-any.whl", hash = "sha256:eed2c47e24fb5c77d7f80e77241a344372d1030c8ae9dfdb393f72b880ea84f3", size = 34265, upload-time = "2025-05-19T15:12:14.916Z" },
+]
+
+[[package]]
 name = "aiohappyeyeballs"
 version = "2.7.1"
 source = { registry = "https://pypi.org/simple" }
@@ -139,6 +153,23 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/61/62/06741b579156360248d1ec624842ad0edf697050bbaf7c3e46394e106ad1/aiosignal-1.4.0.tar.gz", hash = "sha256:f47eecd9468083c2029cc99945502cb7708b082c232f9aca65da147157b251c7", size = 25007, upload-time = "2025-07-03T22:54:43.528Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/fb/76/641ae371508676492379f16e2fa48f4e2c11741bd63c48be4b12a6b09cba/aiosignal-1.4.0-py3-none-any.whl", hash = "sha256:053243f8b92b990551949e63930a839ff0cf0b0ebbe0597b0f3fb19e1a0fe82e", size = 7490, upload-time = "2025-07-03T22:54:42.156Z" },
+]
+
+[[package]]
+name = "anarcii"
+version = "2.0.8"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "gemmi" },
+    { name = "msgpack" },
+    { name = "numpy" },
+    { name = "psutil" },
+    { name = "sortedcontainers" },
+    { name = "torch" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/1f/6e/09d47ef9d629b385bc5f1208b04476bedc427405f87a09a1baa6039328ae/anarcii-2.0.8.tar.gz", hash = "sha256:38bdcbca15dfbb79ff8b7006390756ceb43803cbf9d2392f93fe464970bcad92", size = 17551782, upload-time = "2026-06-30T14:44:47.873Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/a2/48/dc4e9f1c7101e0a4bf8879c273cfead5e0eda66ea9942cdf0220e07798aa/anarcii-2.0.8-py3-none-any.whl", hash = "sha256:6ac81caef04a9cad1af1ea320b35bdced620fe2bfdd0b8b17b98131495b584ca", size = 17560083, upload-time = "2026-06-30T14:44:44.409Z" },
 ]
 
 [[package]]
@@ -938,6 +969,10 @@ notebooks = [
 promb = [
     { name = "promb" },
 ]
+sapiens = [
+    { name = "abnumber" },
+    { name = "sapiens" },
+]
 umap = [
     { name = "umap-learn" },
 ]
@@ -951,6 +986,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
+    { name = "abnumber", marker = "extra == 'sapiens'", specifier = ">=0.4.4" },
     { name = "biopython", specifier = ">=1.85" },
     { name = "biotite" },
     { name = "boltz", marker = "extra == 'boltz2fold'", specifier = ">=2.2" },
@@ -969,6 +1005,7 @@ requires-dist = [
     { name = "pyyaml", marker = "extra == 'boltz2fold'" },
     { name = "pyyaml", marker = "extra == 'boltz2fold-cuda'" },
     { name = "requests" },
+    { name = "sapiens", marker = "extra == 'sapiens'", specifier = ">=1.1.0" },
     { name = "scikit-learn" },
     { name = "scipy" },
     { name = "torch", marker = "extra == 'boltz2fold'" },
@@ -980,7 +1017,7 @@ requires-dist = [
     { name = "transformers", marker = "extra == 'esm2'" },
     { name = "umap-learn", marker = "extra == 'umap'" },
 ]
-provides-extras = ["evmutation2", "evcouplings", "esm2", "mpnn", "promb", "boltz2fold", "boltz2fold-cuda", "umap", "gpytorch", "notebooks"]
+provides-extras = ["evmutation2", "evcouplings", "esm2", "mpnn", "promb", "sapiens", "boltz2fold", "boltz2fold-cuda", "umap", "gpytorch", "notebooks"]
 
 [package.metadata.requires-dev]
 dev = [
@@ -3106,6 +3143,20 @@ wheels = [
 ]
 
 [[package]]
+name = "sapiens"
+version = "1.1.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "pandas" },
+    { name = "torch" },
+    { name = "transformers" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/d7/f2/ae7e495df831a935193021511a2c3141521f3811286ee1baecd4ed788605/sapiens-1.1.0.tar.gz", hash = "sha256:e39906d0cc0861018ff6f0dde6db26408a760e57fb5cff82b49c3747f8ffe4fe", size = 6772, upload-time = "2025-05-11T12:01:43.792Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/1a/8c/e329dad63687d27782fb0b93ecf1aef5ff54e75b9a0dedf9aeb732769301/sapiens-1.1.0-py3-none-any.whl", hash = "sha256:6ec1edc20c4126c99aad9f3e77dea24fc18c2383879874e47f91a5424d9fa221", size = 6785, upload-time = "2025-05-11T12:01:41.84Z" },
+]
+
+[[package]]
 name = "scikit-learn"
 version = "1.6.1"
 source = { registry = "https://pypi.org/simple" }
@@ -3303,6 +3354,15 @@ source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/1f/ea/49c993d6dfdd7338c9b1000a0f36817ed7ec84577ae2e52f890d1a4ff909/smmap-5.0.3.tar.gz", hash = "sha256:4d9debb8b99007ae47165abc08670bd74cb74b5227dda7f643eccc4e9eb5642c", size = 22506, upload-time = "2026-03-09T03:43:26.1Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/c1/d4/59e74daffcb57a07668852eeeb6035af9f32cbfd7a1d2511f17d2fe6a738/smmap-5.0.3-py3-none-any.whl", hash = "sha256:c106e05d5a61449cf6ba9a1e650227ecfb141590d2a98412103ff35d89fc7b2f", size = 24390, upload-time = "2026-03-09T03:43:24.361Z" },
+]
+
+[[package]]
+name = "sortedcontainers"
+version = "2.4.0"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/e8/c4/ba2f8066cceb6f23394729afe52f3bf7adec04bf9ed2c820b39e19299111/sortedcontainers-2.4.0.tar.gz", hash = "sha256:25caa5a06cc30b6b83d11423433f65d1f9d76c4c6a0c90e3379eaa43b9bfdb88", size = 30594, upload-time = "2021-05-16T22:03:42.897Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/32/46/9cb0e58b2deb7f82b84065f37f3bffeb12413f947f9388e4cac22c4621ce/sortedcontainers-2.4.0-py2.py3-none-any.whl", hash = "sha256:a163dcaede0f1c021485e957a39245190e74249897e2ae4b2aa38595db237ee0", size = 29575, upload-time = "2021-05-16T22:03:41.177Z" },
 ]
 
 [[package]]

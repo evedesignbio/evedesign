@@ -35,6 +35,7 @@ evcouplings = ["evcouplings"]
 esm2 = ["torch", "transformers"]
 mpnn = ["torch", "prody"]
 promb = ["promb"]
+sapiens = ["sapiens>=1.1.0", "abnumber>=0.4.4"]
 # boltz2fold: CPU/MPS install (default).
 # boltz2fold-cuda: adds boltz's [cuda] extra, which pulls
 # cuequivariance_ops_cu12, cuequivariance_ops_torch_cu12, and
@@ -69,6 +70,7 @@ markers = [
     "esm2: tests requiring the esm2 extra (torch, transformers)",
     "evcouplings: tests requiring the evcouplings extra",
     "mpnn: tests requiring the mpnn extra (torch, prody)",
+    "sapiens: tests requiring the sapiens extra (sapiens, abnumber)",
 ]
 
 [tool.coverage.run]
