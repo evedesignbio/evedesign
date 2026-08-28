@@ -39,6 +39,24 @@ class Site(TypedDict):
     weight: float | None  # e.g. population weight
 
 
+class SapiensMutation(TypedDict):
+    entity: int
+    pos: int
+    ref: str
+    to: str
+
+
+class SapiensGeneration(TypedDict):
+    iterations: int
+    scheme: str
+    cdr_definition: str
+    humanize_cdrs: bool
+    backmutate_vernier: bool
+    entities: list[int]
+    fixed_positions: dict[int, list[int]]
+    mutations: list[SapiensMutation]
+
+
 SCORE_COMPONENT_KEY = "scores"
 CHAIN_COMPONENT_KEY = "design_chain"
 SEQSPACE_PROJECTION_COMPONENT_KEY = "seqspace_projection"
@@ -48,6 +66,7 @@ class Metadata(TypedDict):
     design_chain: NotRequired[DesignChain]
     seqspace_projection: NotRequired[list[float]]
     sites: NotRequired[list[Site]]
+    sapiens: NotRequired[SapiensGeneration]
 
 
 class SequenceMetadata(TypedDict):
