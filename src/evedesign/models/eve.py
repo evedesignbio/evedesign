@@ -16,14 +16,16 @@ import numpy as np
 
 from evedesign.model import (
     BaseModel,
+    Generator,
     Scorer,
+    Transformer,
     MutationScorer,
     assign_scores_to_instances,
 )
 from evedesign.system import System, SystemInstance, EntityInstance
 from evedesign.constants import GAP
-from evedesign.utils import status_start, status_done
-from evedesign.types import DeviceType, StatusCallback, BatchSize
+from evedesign.utils import status_start, status_done, ensure_sequence
+from evedesign.types import DeviceType, StatusCallback, BatchSize, EntityPosList
 from .evemodel.params import DEFAULT_MODEL_PARAMETERS
 
 torch = None
@@ -52,9 +54,9 @@ def _import_eve() -> bool:
 IMPORT_AVAILABLE = _import_eve()
 
 
-class EVE(BaseModel, Scorer, MutationScorer):
+class EVE(BaseModel, Generator, Scorer, Transformer, MutationScorer):
     """
-    Wrapper class around the EVE model (build + score only, for VEP)
+    Wrapper class around the EVE model (training, scoring, latent embedding and generation)
     """
     available = IMPORT_AVAILABLE
     name: str = "EVE"
@@ -493,6 +495,20 @@ class EVE(BaseModel, Scorer, MutationScorer):
                     encoding[i, j, k] = 1.0
         return encoding
 
+    def _resolve_batch_size(self, num_seqs: int) -> int:
+        """
+        Resolve self.batch_size into a concrete batch size for a run over num_seqs
+        sequences. A batch_size of None means "no limit", i.e. a single batch holding
+        every sequence; it must be resolved to an int rather than passed to DataLoader
+        directly, which reads batch_size=None as "disable batching" and would instead
+        yield unbatched, single-sequence tensors.
+        """
+        if self.batch_size is not None:
+            return self.batch_size
+
+        # DataLoader requires a positive batch size even when there is nothing to load
+        return max(num_seqs, 1)
+
     def _compute_elbo(
         self,
         seqs: Sequence[str],
@@ -504,9 +520,11 @@ class EVE(BaseModel, Scorer, MutationScorer):
         one_hot = self._one_hot_encode(seqs)
         self._load_model()
 
+        batch_size = self._resolve_batch_size(len(seqs))
+
         tensor = torch.tensor(one_hot)
         dataloader = DataLoader(
-            tensor, batch_size=self.batch_size, shuffle=False
+            tensor, batch_size=batch_size, shuffle=False
         )
 
         prediction_matrix = torch.zeros((len(seqs), self.num_samples))
@@ -514,13 +532,13 @@ class EVE(BaseModel, Scorer, MutationScorer):
         with torch.no_grad():
             for batch_idx, batch in enumerate(dataloader):
                 x = batch.type(self.model.dtype).to(self.device)
-                offset = batch_idx * self.batch_size
+                offset = batch_idx * batch_size
                 for sample_idx in range(self.num_samples):
                     elbo, _, _ = self.model.all_likelihood_components(x)
                     prediction_matrix[offset:offset + len(x), sample_idx] = elbo
 
                 if status_callback is not None:
-                    progress = ((batch_idx + 1) * self.batch_size / len(seqs)) * 100
+                    progress = ((batch_idx + 1) * batch_size / len(seqs)) * 100
                     status_callback(
                         "running", min(progress, 100.0),
                         f"Scored {min(offset + len(x), len(seqs))}/{len(seqs)} sequences"
@@ -532,16 +550,13 @@ class EVE(BaseModel, Scorer, MutationScorer):
 
         return mean_elbo
 
-    def score(
+    def _normalized_seqs(
         self,
         instances: Sequence[SystemInstance],
-        status_callback: StatusCallback | None = None,
-    ) -> list[SystemInstance]:
-        self.ready_or_raise()
-
-        # ProteinGym instances mark mutated positions in lowercase; case carries no
-        # meaning for EVE's fixed-length one-hot encoding, so validate/score against
-        # uppercased copies while returning scores against the original instances.
+    ) -> list[str]:
+        """
+        Validate instances against the modelled system and return their sequences as strings.
+        """
         normalized = [
             SystemInstance([EntityInstance(rep="".join(instance[0].rep).upper())])
             for instance in instances
@@ -550,11 +565,258 @@ class EVE(BaseModel, Scorer, MutationScorer):
         # validate sequences against the modelled system (fixed length, no deletions)
         self._validate_instances(normalized)
 
-        seqs = [
+        return [
             "".join(instance[0].rep) for instance in normalized
         ]
+
+    def score(
+        self,
+        instances: Sequence[SystemInstance],
+        status_callback: StatusCallback | None = None,
+    ) -> list[SystemInstance]:
+        self.ready_or_raise()
+
+        seqs = self._normalized_seqs(instances)
 
         scores = self._compute_elbo(seqs, status_callback)
 
         # confidence will be set to None in call
         return assign_scores_to_instances(instances, scores)
+
+    def _encode_latent(
+        self,
+        seqs: Sequence[str],
+        status_callback: StatusCallback | None = None,
+    ) -> np.ndarray:
+        """
+        Encode fixed-length sequences into the VAE latent space, returning the mean of the
+        approximate posterior q(z | x) for each sequence (shape (len(seqs), z_dim)).
+
+        The latent mean is used rather than a sample from the posterior so that embeddings are
+        deterministic and reproducible across calls.
+        """
+        one_hot = self._one_hot_encode(seqs)
+        self._load_model()
+
+        # nothing to concatenate below, so return the correctly shaped empty result
+        if not seqs:
+            return np.zeros((0, self.model.encoder.z_dim))
+
+        batch_size = self._resolve_batch_size(len(seqs))
+
+        tensor = torch.tensor(one_hot)
+        dataloader = DataLoader(
+            tensor, batch_size=batch_size, shuffle=False
+        )
+
+        latent = []
+
+        with torch.no_grad():
+            for batch_idx, batch in enumerate(dataloader):
+                x = batch.type(self.model.dtype).to(self.device)
+                mu, _ = self.model.encoder(x)
+                latent.append(mu.detach().cpu().numpy())
+
+                if status_callback is not None:
+                    num_done = min((batch_idx + 1) * batch_size, len(seqs))
+                    status_callback(
+                        "running", (num_done / len(seqs)) * 100,
+                        f"Embedded {num_done}/{len(seqs)} sequences"
+                    )
+
+        embeddings = np.concatenate(latent, axis=0)
+
+        assert len(embeddings) == len(seqs), "Number of embeddings does not match number of sequences"
+
+        return embeddings
+
+    def transform(
+        self,
+        instances: Sequence[SystemInstance],
+        entity: int | None = None,
+        status_callback: StatusCallback | None = None,
+    ) -> list[SystemInstance]:
+        """
+        Embed instances in the VAE latent space, storing the latent mean (a vector of length
+        z_dim) as the per-entity embedding of each instance.
+
+        Note: unlike other Transformer implementations, this method does not set the score
+        attribute. EVE's score is a sampled ELBO that requires num_samples (20000 by default)
+        forward passes per sequence, i.e. orders of magnitude more compute than the single
+        encoder pass needed for the embedding. Call score() explicitly if scores are needed.
+        """
+        self.ready_or_raise()
+
+        entity = 0 if entity is None else entity
+        if entity != 0:
+            raise ValueError("Model can only handle one single entity")
+
+        seqs = self._normalized_seqs(instances)
+
+        embeddings = self._encode_latent(seqs, status_callback)
+
+        # perform shallow copy of instances and entity instances inside
+        instances_transformed = [
+            inst.copy() for inst in instances
+        ]
+
+        for i, inst in enumerate(instances_transformed):
+            inst.score = None
+            inst.confidence = None
+            inst[0].embedding = embeddings[i]
+
+        return instances_transformed
+
+    def _decode_indices(
+        self,
+        indices: np.ndarray,
+    ) -> list[str]:
+        """
+        Map sampled alphabet indices at the model's focus columns back onto full-length
+        target sequences (inverse of _one_hot_encode()).
+
+        Positions outside the focus columns are not modelled by EVE and always retain the
+        target (wild-type) symbol. Every focus column is sampled; generate() rejects
+        fixed_pos, so there is no subset of held-fixed positions to preserve here.
+        """
+        index_to_aa = {
+            index: letter for letter, index in self._aa_dict.items()
+        }
+
+        target = self.system[0]
+
+        seqs = []
+        for row in indices:
+            seq = list(target.rep)
+            for j, col in enumerate(self._focus_cols):
+                seq[col] = index_to_aa[int(row[j])]
+            seqs.append("".join(seq))
+
+        return seqs
+
+    def generate(
+        self,
+        num_designs: int,
+        entities: Sequence[int] | None = None,
+        fixed_pos: EntityPosList | None = None,
+        temperature: float = 1.0,
+        status_callback: StatusCallback | None = None,
+    ) -> list[SystemInstance]:
+        """
+        Sample new sequences from the family VAE by drawing latent vectors from the prior
+        N(0, I) and sampling residues from the decoder's per-position distribution.
+
+        Designs are gap-free and have the same length as the target sequence; only the
+        model's focus columns (see positions()) are sampled, all other positions retain the
+        target symbol. Note that EVE's Bayesian decoder re-samples its weights on every
+        forward pass, so designs remain diverse even for identical latent vectors.
+
+        Fixing individual positions (fixed_pos) is not supported and raises a ValueError.
+        EVE's decoder factorizes as p(x | z) = prod_i p(x_i | z), so it cannot condition
+        the sampled residues on a subset of held-fixed residues: the only way to honour
+        fixed_pos here would be to sample from the prior and overwrite those positions
+        afterwards, which leaves the sampled residues drawn independently of the residues
+        the caller asked to keep. Rather than return designs that look conditioned but are
+        not, the option is rejected outright (conditioning would instead require drawing z
+        from the posterior q(z | x) of the target, which this method does not do).
+
+        Returned scores are the difference in ELBO relative to the target (wild-type)
+        sequence, i.e. the negative of EVE's evolutionary index (higher is more favourable).
+        Scoring dominates the runtime of this method via the num_samples parameter.
+        """
+        self.ready_or_raise()
+
+        if num_designs < 1:
+            raise ValueError("num_designs must be at least 1")
+
+        if temperature <= 0:
+            raise ValueError("temperature must be positive")
+
+        # verify validity of entity selection, even if not used since
+        # at this point method can only handle single entity
+        if entities is not None:
+            entities = ensure_sequence(entities)
+            if len(entities) != 1 or entities[0] != 0:
+                raise ValueError("Can only design single entity (entities = [0] | None)")
+
+        target = self.system[0]
+
+        # reject any request to hold positions fixed (see docstring): EVE's decoder cannot
+        # condition on them. An empty mapping asks for nothing to be fixed, so it is
+        # accepted as a no-op for callers that assemble fixed_pos programmatically.
+        if fixed_pos is not None:
+            if any(key != 0 for key in fixed_pos):
+                raise ValueError(
+                    "Only accepting position mapping for entity 0"
+                )
+
+            if any(len(positions) > 0 for positions in fixed_pos.values()):
+                raise ValueError(
+                    "Fixing positions is not supported by EVE: its decoder factorizes "
+                    "over positions given the latent vector and cannot condition sampled "
+                    "residues on held-fixed ones. Pass fixed_pos=None and filter the "
+                    "returned designs on score instead."
+                )
+
+        self._load_model()
+
+        # read z_dim off the decoder being sampled from rather than the encoder config
+        z_dim = self.model.decoder.z_dim
+        batch_size = self._resolve_batch_size(num_designs)
+
+        sampled = []
+
+        with torch.no_grad():
+            for offset in range(0, num_designs, batch_size):
+                num_batch = min(batch_size, num_designs - offset)
+
+                # sample latent vectors from the prior and decode into per-position log-probs
+                z = torch.randn(
+                    num_batch, z_dim, device=torch.device(self.device), dtype=self.model.dtype
+                )
+                log_probs = self.model.decoder(z)
+
+                # sample residues from the tempered per-position categorical distribution
+                probs = torch.softmax(log_probs / temperature, dim=-1)
+                indices = torch.multinomial(
+                    probs.reshape(-1, self._alphabet_size), num_samples=1
+                ).reshape(num_batch, self._seq_len)
+
+                sampled.append(indices.detach().cpu().numpy())
+
+                if status_callback is not None:
+                    num_done = offset + num_batch
+                    status_callback(
+                        "running", (num_done / num_designs) * 100,
+                        f"Generated {num_done}/{num_designs} designs"
+                    )
+
+        designs = self._decode_indices(
+            np.concatenate(sampled, axis=0)
+        )
+
+        # score the designs relative to the target sequence, so scores are comparable
+        # to the wild type rather than being raw (unnormalized) ELBOs
+        ref_and_designs = ["".join(target.rep)] + designs
+        instances = [
+            SystemInstance(
+                [EntityInstance(rep=rep)]
+            ) for rep in ref_and_designs
+        ]
+
+        # confidences will be set to None in call; the callback is deliberately not
+        # forwarded, as score() would otherwise restart progress from 0 after generation
+        # has already reported 100%
+        scored_ref_and_instances = self.score(instances)
+        ref_score = scored_ref_and_instances[0].score
+
+        # remove reference from list, set normalized score in place
+        scored_instances = scored_ref_and_instances[1:]
+        for inst in scored_instances:
+            inst.score -= ref_score
+
+        assert len(scored_instances) >= num_designs, "Not returning minimum guaranteed number of designs"
+
+        status_done(status_callback, f"Generated {len(scored_instances)} designs")
+
+        return scored_instances

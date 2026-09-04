@@ -83,3 +83,83 @@ def test_build_train_serialize_and_score() -> None:
     assert len(scored) == 2
     assert all(instance.score is not None for instance in scored)
     assert np.isfinite([instance.score for instance in scored]).all()
+
+
+@pytest.mark.slow
+def test_transform_embeds_in_latent_space() -> None:
+    """Embed sequences in the VAE latent space via transform()."""
+    system = _synthetic_system()
+    model = EVE(
+        model_hyperparameters=_small_hyperparameters(),
+        model_checkpoint_path=None,
+        use_weights=False,
+        preprocess_msa=False,
+        num_samples=2,
+        batch_size=2,
+        device="cpu",
+    ).build(system)
+
+    instances = [
+        system.rep_to_instance(),
+        SystemInstance([EntityInstance(rep="ACDF")]),
+    ]
+    transformed = model.transform(instances)
+
+    assert len(transformed) == 2
+    for instance in transformed:
+        # z_dim = 2 in the small test hyperparameters
+        assert instance[0].embedding.shape == (2,)
+        assert np.isfinite(instance[0].embedding).all()
+        # transform() deliberately does not compute the (expensive) ELBO
+        assert instance.score is None
+
+    # different sequences should not collapse onto the same latent mean
+    assert not np.allclose(transformed[0][0].embedding, transformed[1][0].embedding)
+
+    # inputs must not be mutated
+    assert all(instance[0].embedding is None for instance in instances)
+
+    with pytest.raises(ValueError):
+        model.transform(instances, entity=1)
+
+
+@pytest.mark.slow
+def test_generate_samples_sequences() -> None:
+    """Sample new sequences from the VAE prior via generate()."""
+    system = _synthetic_system()
+    target = system[0]
+    model = EVE(
+        model_hyperparameters=_small_hyperparameters(),
+        model_checkpoint_path=None,
+        use_weights=False,
+        preprocess_msa=False,
+        num_samples=2,
+        batch_size=2,
+        device="cpu",
+    ).build(system)
+
+    designs = model.generate(num_designs=3)
+
+    assert len(designs) >= 3
+    for design in designs:
+        assert len(design[0].rep) == len(target.rep)
+        assert set(design[0].rep) <= set("ACDEFGHIKLMNPQRSTVWY")
+        assert design.score is not None and np.isfinite(design.score)
+
+    with pytest.raises(ValueError):
+        model.generate(num_designs=2, entities=[1])
+
+    # EVE's decoder cannot condition on held-fixed residues, so fixed_pos is rejected
+    # rather than silently applied as a post-hoc overwrite
+    with pytest.raises(ValueError):
+        model.generate(num_designs=2, fixed_pos={0: [target.first_index]})
+
+    with pytest.raises(ValueError):
+        model.generate(num_designs=2, fixed_pos={0: [pos for _, pos in model.positions()]})
+
+    with pytest.raises(ValueError):
+        model.generate(num_designs=2, fixed_pos={1: [target.first_index]})
+
+    # an empty request fixes nothing, so it is accepted as a no-op
+    assert len(model.generate(num_designs=2, fixed_pos={})) >= 2
+    assert len(model.generate(num_designs=2, fixed_pos={0: []})) >= 2
