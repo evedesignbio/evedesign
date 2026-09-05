@@ -43,6 +43,10 @@ boltzgen = ["boltzgen>=0.3,<0.4"]
 umap = ["umap-learn"]
 gpytorch = ["torch", "gpytorch"]
 notebooks = ["py3Dmol"]
+mcp = ["fastmcp>=2.0"]
+
+[project.scripts]
+evedesign-mcp = "evedesign.mcp.server:main"
 
 [project.urls]
 Documentation = "https://github.com/evedesignbio/evedesign#readme"
