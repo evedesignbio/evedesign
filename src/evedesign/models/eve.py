@@ -23,7 +23,7 @@ from evedesign.model import (
     assign_scores_to_instances,
 )
 from evedesign.system import System, SystemInstance, EntityInstance
-from evedesign.constants import GAP
+from evedesign.constants import GAP, MASK
 from evedesign.utils import status_start, status_done, ensure_sequence
 from evedesign.types import DeviceType, StatusCallback, BatchSize, EntityPosList
 from .evemodel.params import DEFAULT_MODEL_PARAMETERS
@@ -550,23 +550,18 @@ class EVE(BaseModel, Generator, Scorer, Transformer, MutationScorer):
 
         return mean_elbo
 
-    def _normalized_seqs(
+    def _instance_seqs(
         self,
         instances: Sequence[SystemInstance],
     ) -> list[str]:
         """
-        Validate instances against the modelled system and return their sequences as strings.
+        Validate instances against the modelled system (fixed length, no deletions) and
+        return their sequences as strings.
         """
-        normalized = [
-            SystemInstance([EntityInstance(rep="".join(instance[0].rep).upper())])
-            for instance in instances
-        ]
-
-        # validate sequences against the modelled system (fixed length, no deletions)
-        self._validate_instances(normalized)
+        self._validate_instances(instances)
 
         return [
-            "".join(instance[0].rep) for instance in normalized
+            "".join(instance[0].rep) for instance in instances
         ]
 
     def score(
@@ -576,7 +571,7 @@ class EVE(BaseModel, Generator, Scorer, Transformer, MutationScorer):
     ) -> list[SystemInstance]:
         self.ready_or_raise()
 
-        seqs = self._normalized_seqs(instances)
+        seqs = self._instance_seqs(instances)
 
         scores = self._compute_elbo(seqs, status_callback)
 
@@ -640,10 +635,11 @@ class EVE(BaseModel, Generator, Scorer, Transformer, MutationScorer):
         Embed instances in the VAE latent space, storing the latent mean (a vector of length
         z_dim) as the per-entity embedding of each instance.
 
-        Note: unlike other Transformer implementations, this method does not set the score
-        attribute. EVE's score is a sampled ELBO that requires num_samples (20000 by default)
-        forward passes per sequence, i.e. orders of magnitude more compute than the single
-        encoder pass needed for the embedding. Call score() explicitly if scores are needed.
+        Note: unlike other Transformer implementations, this method does not compute a score
+        (any score already set on the input instances is carried over unchanged). EVE's score
+        is a sampled ELBO that requires num_samples (20000 by default) forward passes per
+        sequence, i.e. orders of magnitude more compute than the single encoder pass needed
+        for the embedding. Call score() explicitly if scores are needed.
         """
         self.ready_or_raise()
 
@@ -651,7 +647,7 @@ class EVE(BaseModel, Generator, Scorer, Transformer, MutationScorer):
         if entity != 0:
             raise ValueError("Model can only handle one single entity")
 
-        seqs = self._normalized_seqs(instances)
+        seqs = self._instance_seqs(instances)
 
         embeddings = self._encode_latent(seqs, status_callback)
 
@@ -661,8 +657,6 @@ class EVE(BaseModel, Generator, Scorer, Transformer, MutationScorer):
         ]
 
         for i, inst in enumerate(instances_transformed):
-            inst.score = None
-            inst.confidence = None
             inst[0].embedding = embeddings[i]
 
         return instances_transformed
@@ -675,15 +669,28 @@ class EVE(BaseModel, Generator, Scorer, Transformer, MutationScorer):
         Map sampled alphabet indices at the model's focus columns back onto full-length
         target sequences (inverse of _one_hot_encode()).
 
-        Positions outside the focus columns are not modelled by EVE and always retain the
-        target (wild-type) symbol. Every focus column is sampled; generate() rejects
-        fixed_pos, so there is no subset of held-fixed positions to preserve here.
+        Positions outside the focus columns are not modelled by EVE and retain the symbol
+        of the system entity's representation. Every focus column is sampled; generate()
+        rejects fixed_pos, so there is no subset of held-fixed positions to preserve here.
         """
         index_to_aa = {
             index: letter for letter, index in self._aa_dict.items()
         }
 
         target = self.system[0]
+
+        # a final instance may only contain defined symbols of the alphabet, so an
+        # unmodelled position carrying MASK cannot be resolved into a design here
+        focus_cols = set(self._focus_cols)
+        masked = [
+            i for i, symbol in enumerate(target.rep)
+            if symbol == MASK and i not in focus_cols
+        ]
+        if masked:
+            raise ValueError(
+                "Entity representation contains MASK symbols at positions not modelled "
+                f"by EVE, which cannot be assigned by generation: {masked}"
+            )
 
         seqs = []
         for row in indices:
@@ -810,10 +817,11 @@ class EVE(BaseModel, Generator, Scorer, Transformer, MutationScorer):
         scored_ref_and_instances = self.score(instances)
         ref_score = scored_ref_and_instances[0].score
 
-        # remove reference from list, set normalized score in place
-        scored_instances = scored_ref_and_instances[1:]
-        for inst in scored_instances:
-            inst.score -= ref_score
+        # drop the reference from the list and normalize the design scores against it
+        scored_instances = assign_scores_to_instances(
+            scored_ref_and_instances[1:],
+            [inst.score - ref_score for inst in scored_ref_and_instances[1:]],
+        )
 
         assert len(scored_instances) >= num_designs, "Not returning minimum guaranteed number of designs"
 
