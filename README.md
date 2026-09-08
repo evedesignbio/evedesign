@@ -88,6 +88,10 @@ the underlying [model interfaces](src/evedesign/model.py) and
 
 We are happy to help if you have any questions!
 
+If you're working with an AI coding agent, see [src/evedesign/mcp](src/evedesign/mcp) for an MCP server
+that lets it look up evedesign's models, interfaces and conventions directly. 
+See [AGENTS.md](AGENTS.md) for a general orientation to the codebase.
+
 ## Currently available models and methods
 
 ### Biomolecular models, embedders and restraints
