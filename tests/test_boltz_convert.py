@@ -1,10 +1,13 @@
 from pathlib import Path
 
 import pytest
+import yaml
 
-from evedesign.models.boltz.convert import _write_a3m, _write_csv
+from evedesign.models.boltz.convert import (
+    _write_a3m, _write_csv, system_instance_to_yaml,
+)
 from evedesign.sequence import Sequence, Sequences
-from evedesign.system import Entity, EntityInstance
+from evedesign.system import Entity, EntityInstance, System, SystemInstance
 
 # convert.py imports pyyaml, which only ships in the boltz2fold extras
 pytestmark = pytest.mark.boltz2fold
@@ -82,25 +85,23 @@ def test_write_a3m_remap_applied_on_insertion(tmp_path):
     assert [r[1] for r in records[1:]] == ["ALS-D", "ALC-E"]
 
 
-def test_write_a3m_remap_failure_falls_back_verbatim(tmp_path):
-    # Malformed input: hit length (3) != len(old_query) (4) -> remap_query raises
-    # ValueError; _write_a3m must fall back to verbatim and log a warning.
-    entity = _entity_with_msa("ALCD", [Sequence("ALS", id="seq1")])
-    instance = EntityInstance(rep="VICD")
+def test_msa_file_is_written_per_instance(tmp_path):
+    # All YAMLs of a batch are written before Boltz-2 reads any of them, so each
+    # instance's MSA must still hold its own query once all are on disk.
+    entity = _entity_with_msa("ALCD", [Sequence("ALSD", id="seq1"), Sequence("ALCE", id="seq2")])
+    system = System([entity])
 
-    import loguru
+    entries = []
+    for i, rep in enumerate(["VICD", "MLCD"]):
+        yaml_path = tmp_path / f"instance_{i}.yaml"
+        system_instance_to_yaml(
+            system, SystemInstance([EntityInstance(rep=rep)]), yaml_path
+        )
+        entries.append(yaml.safe_load(yaml_path.read_text())["sequences"][0]["protein"])
 
-    messages: list[str] = []
-    handler_id = loguru.logger.add(lambda m: messages.append(str(m)), level="WARNING")
-    try:
-        out = _write_a3m(entity, instance, tmp_path / "msa" / "A.a3m", old_query=entity.rep)
-    finally:
-        loguru.logger.remove(handler_id)
-
-    records = _read_a3m(out)
-    assert records[0] == ("query", "VICD")
-    assert [r[1] for r in records[1:]] == ["ALS"]  # unmodified hit
-    assert any("could not remap MSA" in m for m in messages)
+    assert entries[0]["msa"] != entries[1]["msa"]
+    for entry in entries:
+        assert _read_a3m(Path(entry["msa"]))[0][1] == entry["sequence"]
 
 
 def test_write_csv_real_mmseqs_pair_keys(tmp_path):

@@ -15,51 +15,76 @@ import yaml
 import json
 from loguru import logger
 
+from evedesign.models.boltz.chains import _get_chain_ids
 from evedesign.system import Entity, EntityInstance, System, SystemInstance, StructureChainMap, Structure
+from evedesign.sequence import Sequence, Sequences
 from evedesign.structure import StructureFile
 from evedesign.types import Score, RepSequence
 
 # 1. evedesign Entity --> to Boltz-2 YAML
 
-# Chain ID generation
-# Boltz-2 uses chain IDs to identify entities in the system. We need to generate unique chain IDs for each entity instance. 
-# The convention is to use uppercase letters (A-Z) for the first 26 entities, then double letters (AA, AB, AC, ...) for additional entities. 
-# This function generates the appropriate chain ID based on the entity's position in the system.
-def _get_chain_id(chain_num: int) -> str:
-    """Generate chain ID: A-Z, then AA, AB, AC, ..."""
-    if chain_num < 26:
-        return chr(65 + chain_num)
-    else:
-        first = chr(65 + (chain_num - 26) // 26)
-        second = chr(65 + (chain_num - 26) % 26)
-        return first + second
+
+def _match_columns(seq: str) -> int:
+    """Alignment columns a row spans (lowercase = insertion, spans none)."""
+    return sum(1 for ch in seq if not ch.islower())
 
 
-def _get_chain_ids(system: System) -> list[str]:
+def _encode_in_frame(frame: str, rep: str) -> str | None:
     """
-    Generate one chain ID per chain in the system.
+    Express ``rep`` in ``frame``'s columns, so remap_query can map the hits
+    from one to the other.
 
-    IDs follow the sequence A-Z, then AA, AB, AC, ...
-    Each entity consumes max(entity.copies, 1) IDs.
+    Returns rep unchanged when it already spans the frame's columns, or None
+    when it cannot be placed in them.
     """
-    total = sum(
-        max(e.copies, 1) if e.copies is not None else 1
-        for e in system
+    if _match_columns(rep) == _match_columns(frame):
+        return rep
+
+    residues = iter(rep)
+    encoded = []
+    for column in frame:
+        if column == "-":
+            encoded.append("-")
+        else:
+            residue = next(residues, None)
+            if residue is None:
+                return None
+            encoded.append(residue)
+
+    if next(residues, None) is not None:
+        return None
+
+    return "".join(encoded)
+
+
+def _leads_with_query(sequences: Sequences) -> bool:
+    """
+    True if the alignment keeps its query as its first row (A3M convention).
+    """
+    return (
+        sequences.query is not None
+        and bool(sequences.seqs)
+        and sequences.seqs[0].seq == sequences.query
     )
-    return [_get_chain_id(i) for i in range(total)]
 
 
-def _chain_to_entity_map(system: System) -> dict[str, int]:
-    """Maps each Boltz-2 chain ID back to its evedesign entity index."""
-    chain_ids = _get_chain_ids(system)
-    result: dict[str, int] = {}
-    pointer = 0
-    for entity_idx, entity in enumerate(system):
-        copies = entity.copies if entity.copies is not None else 1
-        for chain_id in chain_ids[pointer:pointer + copies]:
-            result[chain_id] = entity_idx
-        pointer += copies
-    return result
+def _hits_fit_query(
+    hits: list[Sequence], query_line: str, entity_id: str | None
+) -> bool:
+    """
+    True if every hit spans the same number of columns as the query.
+    """
+    bad = [
+        seq.id_ for seq in hits
+        if _match_columns(seq.seq) != len(query_line)
+    ]
+    if bad:
+        logger.warning(
+            f"Entity '{entity_id}': {len(bad)} MSA hit(s) do not span the "
+            f"{len(query_line)} columns of the instance rep (e.g. {bad[:3]}); "
+            f"folding without an MSA."
+        )
+    return not bad
 
 
 # A3M writer
@@ -69,7 +94,7 @@ def _write_a3m(
     entity_instance: EntityInstance,
     output_path: Path,
     old_query: str | RepSequence | None = None,
-) -> Path:
+) -> Path | None:
     """Write an A3M file with the query sequence followed by MSA hits.
 
     The MSA hits in ``entity.sequences`` were searched once against a base
@@ -83,43 +108,53 @@ def _write_a3m(
     old_query
         The query the current ``entity.sequences`` were aligned against
         (typically ``entity.rep``). If None, equal to the instance rep, or
-        the remap fails, the hits are written verbatim (back-compatible
-        behavior).
-    """
-    output_path.parent.mkdir(parents=True, exist_ok=True)
+        the remap fails, the hits are kept as stored.
 
+    Returns
+    -------
+    Path to the written file, or None if the hits do not line up with the
+    query. The caller then folds without an MSA, which is better than folding
+    against a misaligned one.
+    """
     new_query = "".join(entity_instance.rep)
 
-    # Reuse the base MSA across instances by remapping its columns to the
-    # current instance rep. Skip when there is nothing to remap against, the
-    # query is unchanged, or the remap is not possible — folding with the raw
-    # MSA is preferable to crashing.
+    query_line = EntityInstance.normalize_rep_str(new_query)
+
     sequences = entity.sequences
+    skip_query_row = _leads_with_query(sequences)
     if old_query is not None:
         old_query_str = "".join(old_query)
-        if old_query_str != new_query:
-            try:
-                sequences = entity.sequences.remap_query(
-                    old_query_str, new_query, prepend_new_query=False
-                )
-            except (ValueError, NotImplementedError) as exc:
-                logger.warning(
-                    f"Entity '{entity.id}': could not remap MSA from base query "
-                    f"to instance rep ({exc}); writing hits verbatim."
-                )
-                sequences = entity.sequences
+        framed_query = _encode_in_frame(old_query_str, new_query)
+        if framed_query is None:
+            logger.warning(
+                f"Entity '{entity.id}': instance rep does not fit the "
+                f"{_match_columns(old_query_str)} columns its MSA is aligned "
+                f"to; folding without an MSA."
+            )
+            return None
+        try:
+            sequences = entity.sequences.remap_query(
+                old_query_str, framed_query
+            )
+        except (ValueError, NotImplementedError) as exc:
+            logger.warning(
+                f"Entity '{entity.id}': could not remap MSA from base query "
+                f"to instance rep ({exc})."
+            )
+            sequences = entity.sequences
 
+    hits = list(sequences.seqs)[1:] if skip_query_row else list(sequences.seqs)
+    if not _hits_fit_query(hits, query_line, entity.id):
+        return None
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
     with open(output_path, "w") as f:
-        # Query sequence first. The raw rep (with gaps/lowercase) is what
-        # remap_query needs to identify column transitions, but the A3M query
-        # line must be the actual designed sequence boltz folds: gaps stripped
-        # (deleted positions are not residues) and insertions uppercased.
+        # Query sequence first
         header = entity.id or "query"
-        query_line = EntityInstance.normalize_rep_str(new_query)
         f.write(f">{header}\n{query_line}\n")
 
         # MSA hits (remapped to the current instance when applicable)
-        for seq in sequences.seqs:
+        for seq in hits:
             f.write(f">{seq.id_ or 'seq'}\n{seq.seq}\n")
 
     return output_path
@@ -130,7 +165,7 @@ def _write_csv(
     entity_instance: EntityInstance,
     output_path: Path,
     old_query: str | RepSequence | None = None,
-) -> Path:
+) -> Path | None:
     """
     Write a Boltz-2 compatible CSV MSA file preserving
     pairing keys from Sequence.key.
@@ -145,33 +180,47 @@ def _write_csv(
     This format is required for paired MSAs in multi-chain
     complexes. Boltz-2's CSV parser uses the key column as
     taxonomy_id to match paired rows across chains.
-    """
-    output_path.parent.mkdir(parents=True, exist_ok=True)
 
+    Returns None if the hits do not line up with the query; see _write_a3m.
+    """
     new_query = "".join(entity_instance.rep)
+    query_line = EntityInstance.normalize_rep_str(new_query)
 
     sequences = entity.sequences
+    skip_query_row = _leads_with_query(sequences)
     if old_query is not None:
         old_query_str = "".join(old_query)
-        if old_query_str != new_query:
-            try:
-                sequences = entity.sequences.remap_query(
-                    old_query_str, new_query, prepend_new_query=False
-                )
-            except (ValueError, NotImplementedError) as exc:
-                logger.warning(
-                    f"Entity '{entity.id}': could not remap paired MSA from base "
-                    f"query to instance rep ({exc}); writing hits verbatim."
-                )
-                sequences = entity.sequences
+        framed_query = _encode_in_frame(old_query_str, new_query)
+        if framed_query is None:
+            logger.warning(
+                f"Entity '{entity.id}': instance rep does not fit the "
+                f"{_match_columns(old_query_str)} columns its paired MSA is "
+                f"aligned to; folding without an MSA."
+            )
+            return None
+        try:
+            sequences = entity.sequences.remap_query(
+                old_query_str, framed_query
+            )
+        except (ValueError, NotImplementedError) as exc:
+            logger.warning(
+                f"Entity '{entity.id}': could not remap paired MSA from base "
+                f"query to instance rep ({exc})."
+            )
+            sequences = entity.sequences
 
+    hits = list(sequences.seqs)[1:] if skip_query_row else list(sequences.seqs)
+    if not _hits_fit_query(hits, query_line, entity.id):
+        return None
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
     rows = ["key,sequence"]
-    rows.append(f"0,{EntityInstance.normalize_rep_str(new_query)}")
+    rows.append(f"0,{query_line}")
     key_to_taxid: dict = {}
-    for seq in sequences.seqs:
+    for seq in hits:
         if seq.key is not None and seq.key not in key_to_taxid:
             key_to_taxid[seq.key] = len(key_to_taxid)
-    for seq in sequences.seqs:
+    for seq in hits:
         taxid = key_to_taxid[seq.key] if seq.key is not None else -1
         rows.append(f"{taxid},{seq.seq}")
     output_path.write_text("\n".join(rows) + "\n")
@@ -190,7 +239,7 @@ def _resolve_msa_field(
 
     Returns an absolute path string when a local MSA file was written
     (CSV when pairing keys are present, A3M otherwise), or "empty" when
-    no MSA is available.
+    no MSA is available or none valid for this instance could be written.
     """
     # Warn about unsupported template conditioning
     if entity.structures is not None and len(entity.structures) > 0:
@@ -204,28 +253,27 @@ def _resolve_msa_field(
         and entity.sequences is not None
         and len(entity.sequences.seqs) > 0
     ):
-        # Paired sequences carry a non-None pairing key (see
-        # add_sequences_mmseqs2). The key's format is not inspected —
-        # its presence indicates a paired MSA requiring CSV output.
+        record_id = yaml_path.stem
+        base_query = entity.sequences.query
+        if base_query is None:
+            base_query = entity.rep
         has_pairing = any(
             s.key is not None for s in entity.sequences.seqs
         )
         if has_pairing:
             msa_path = _write_csv(
                 entity, entity_instance,
-                yaml_path.parent / "msa" / f"{chain_id}.csv",
-                old_query=entity.rep,
+                yaml_path.parent / "msa" / f"{record_id}_{chain_id}.csv",
+                old_query=base_query,
             )
         else:
-            # entity.rep is the base query MMSeqs2 searched on (see
-            # add_sequences_mmseqs2); pass it so the hits can be remapped to
-            # this instance's rep instead of triggering a fresh search.
             msa_path = _write_a3m(
                 entity, entity_instance,
-                yaml_path.parent / "msa" / f"{chain_id}.a3m",
-                old_query=entity.rep,
+                yaml_path.parent / "msa" / f"{record_id}_{chain_id}.a3m",
+                old_query=base_query,
             )
-        return str(msa_path.resolve())
+        if msa_path is not None:
+            return str(msa_path.resolve())
 
     return "empty"
 

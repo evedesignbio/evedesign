@@ -1653,6 +1653,9 @@ class System(UserList[Entity]):
         will be normalized, i.e. deletions are removed and insertions
         are converted into regular uppercase symbols.
 
+        Entity instances without a representation fall back to the
+        representation of the corresponding system entity.
+
         Sequences attached to system will not be attached to new system,
         structural models will be added.
 
@@ -1672,10 +1675,15 @@ class System(UserList[Entity]):
         return type(self)([
             Entity(
                 type=entity.type,
-                rep=entity_instance.normalized_rep(),
+                rep=(
+                    entity_instance.normalized_rep()
+                    if entity_instance.rep is not None
+                    else entity.rep
+                ),
                 id=entity.id,
                 copies=entity.copies,
                 first_index=entity.first_index,
+                ligand_rep_type=entity.ligand_rep_type,
                 sequences=None,  # do not copy sequences as we would need to realign them
                 structures=entity_instance.models
             ) for entity, entity_instance in zip(self.data, instance)

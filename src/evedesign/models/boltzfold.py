@@ -30,8 +30,8 @@ try:
     from boltz.data.module.inferencev2 import Boltz2InferenceDataModule
     from boltz.data.types import Manifest
     from boltz.data.write.writer import BoltzWriter
+    from evedesign.models.boltz.chains import _chain_to_entity_map
     from evedesign.models.boltz.convert import (
-        _chain_to_entity_map,
         system_instance_to_yaml,
         prediction_to_instance,
     )
@@ -88,7 +88,22 @@ class BoltzFoldTransformer(BaseModel, Transformer, Scorer):
         confidence_attribute: Literal[
             "iptm", "ptm", "confidence_score", "complex_plddt"
         ] = "complex_plddt",
+        use_kernels: bool | None = None,
     ):
+        """
+        Parameters
+        ----------
+        use_kernels
+            Enable cuequivariance custom CUDA kernels for triangle attention /
+            multiplication. Defaults to None — keeps the existing auto behavior
+            (enabled when device is CUDA, disabled on CPU). Set to False
+            explicitly if you hit a cuequivariance kernel error such as
+            "RuntimeError: CUDA error: 'named symbol not found' at run_fmha.cu:148".
+            This usually indicates a mismatch between the installed
+            cuequivariance_ops build and the CUDA toolkit / GPU compute
+            capability. The PyTorch fallback is ~10-20% slower but works on any
+            GPU.
+        """
         if not self.available:
             raise ValueError(
                 "boltz package could not be imported. Is it installed already?"
@@ -107,6 +122,7 @@ class BoltzFoldTransformer(BaseModel, Transformer, Scorer):
         self.use_msa = use_msa
         self.score_attribute = score_attribute
         self.confidence_attribute = confidence_attribute
+        self._use_kernels = use_kernels
 
         self._system: System | None = None
         self.model: Any | None = None
@@ -202,7 +218,11 @@ class BoltzFoldTransformer(BaseModel, Transformer, Scorer):
             map_location="cpu",
             diffusion_process_args=asdict(diffusion_params),
             ema=False,
-            use_kernels="cuda" in str(self.device),  # different from default
+            use_kernels=(
+                self._use_kernels
+                if self._use_kernels is not None
+                else "cuda" in str(self.device)
+            ),  # different from default
             pairformer_args=asdict(PairformerArgsV2()),
             msa_args=asdict(MSAModuleArgs(use_paired_feature=True)), # different from default
             steering_args=asdict(BoltzSteeringParams()),

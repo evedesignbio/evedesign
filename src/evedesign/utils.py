@@ -1,5 +1,6 @@
 from contextlib import contextmanager
 from collections import defaultdict
+import os
 from typing import Callable, Sequence, TypeVar, Mapping
 import numpy as np
 from evedesign.types import StatusCallback
@@ -127,3 +128,12 @@ def index_map(options: list[any], default_option: any = None, default_value: int
             default = default_value
 
         return defaultdict(lambda: default, mapping)
+
+
+def available_cpus() -> int:
+    # respects cgroup/CPU-affinity limits (Slurm, Docker, k8s); falls back gracefully
+    if hasattr(os, "process_cpu_count"):      # Python 3.13+
+        return os.process_cpu_count() or 1
+    if hasattr(os, "sched_getaffinity"):      # Linux
+        return len(os.sched_getaffinity(0))
+    return os.cpu_count() or 1

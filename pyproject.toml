@@ -1,10 +1,10 @@
 [build-system]
-requires = ["uv_build>=0.11.22,<0.12.0"]
+requires = ["uv_build>=0.11.22,<=0.12.6"]
 build-backend = "uv_build"
 
 [project]
 name = "evedesign"
-version = "0.0.5"
+version = "0.0.6"
 description = ''
 readme = "README.md"
 requires-python = ">=3.12"
@@ -25,23 +25,21 @@ classifiers = [
   "Programming Language :: Python :: Implementation :: PyPy",
 ]
 dependencies = [
-  "numpy", "pandas", "loguru", "biotite", "biopython", "dnachisel", "scikit-learn", "numba", "scipy", "requests"
+  "numpy", "pandas", "loguru", "biotite", "biopython>=1.85", "dnachisel", "scikit-learn", "numba", "scipy", "requests"
 ]
 
 [project.optional-dependencies]
+eve = ["torch", "tqdm"]
 evmutation2 = ["torch", "evmutation2"]
 evcouplings = ["evcouplings"]
 esm2 = ["torch", "transformers"]
 mpnn = ["torch", "prody"]
+promb = ["promb"]
 # boltz2fold: CPU/MPS install (default).
-# boltz2fold-cuda: adds boltz's [cuda] extra, which pulls
-# cuequivariance_ops_cu12, cuequivariance_ops_torch_cu12, and
-# cuequivariance_torch (all >=0.5.0). The cu12 ops wheels are built
-# for CUDA 12 and require a CUDA 12 toolkit/driver plus a
-# CUDA-enabled torch build (verified on CUDA 12.8); not usable on
-# CPU-only or macOS.
+# boltz2fold-cuda: adds boltz's [cuda] 
 boltz2fold = ["torch", "boltz>=2.2", "pyyaml"]
 boltz2fold-cuda = ["torch", "boltz[cuda]>=2.2; sys_platform == 'linux'", "pyyaml"]
+boltzgen = ["boltzgen>=0.3,<0.4"]
 umap = ["umap-learn"]
 gpytorch = ["torch", "gpytorch"]
 notebooks = ["py3Dmol"]
@@ -63,6 +61,8 @@ testpaths = ["tests"]
 markers = [
     "slow: marks tests as slow-running",
     "boltz2fold: tests requiring the boltz2fold extra (torch, boltz, pyyaml)",
+    "boltzgen: tests requiring the boltzgen extra",
+    "eve: tests requiring the eve extra (torch, tqdm)",
     "esm2: tests requiring the esm2 extra (torch, transformers)",
     "evcouplings: tests requiring the evcouplings extra",
     "mpnn: tests requiring the mpnn extra (torch, prody)",
@@ -86,4 +86,6 @@ exclude_lines = [
 
 [tool.uv]
 override-dependencies = [
-    { package = { name = "boltz" }, dependencies = ["numpy>=2.0", "scipy>=1.14", "numba>=0.64"] },]
+    { package = { name = "boltz" }, dependencies = ["numpy>=2.0", "scipy>=1.14", "numba>=0.64", "biopython>=1.85"] },
+    { package = { name = "boltzgen" }, dependencies = ["numpy>=2.0", "numba>=0.64"] },
+]

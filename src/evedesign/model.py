@@ -625,8 +625,24 @@ class MutationScorer(_Core, ABC):
         # build into dataframe and return
         series = pd.Series(scores)
 
+        # update ref on inserts so they end up in the same row in dataframe
+        pos_to_ref = {
+            (mutant[0].entity, mutant[0].pos): mutant[0].ref
+            for mutant in mutants if mutant[0].ref != ""
+        }
+
+        mutants_updated_ref = [
+            (
+                mutant[0].entity,
+                mutant[0].pos,
+                pos_to_ref.get((mutant[0].entity, mutant[0].pos), ""),
+                mutant[0].to,
+            )
+            for mutant in mutants
+        ]
+
         series.index = pd.MultiIndex.from_tuples(
-            [mutant[0] for mutant in mutants], names=["entity", "pos", "ref", "to"]
+           mutants_updated_ref, names=["entity", "pos", "ref", "to"]
         )
 
         # make sure column index (symbols) has right order

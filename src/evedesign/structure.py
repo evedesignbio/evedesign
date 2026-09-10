@@ -317,7 +317,9 @@ class Structure:
         if sequence is not None:
             mismatch = pd.DataFrame({
                 "res_id": positions,
-                "res_name_compare": sequence
+                # lowercase codes an insertion rather than a different
+                # residue (cf. EntityInstance), so compare case-insensitively
+                "res_name_compare": [str(s).upper() for s in sequence]
             }).merge(
                 df, on="res_id"
             ).query(

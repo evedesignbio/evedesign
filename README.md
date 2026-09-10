@@ -28,7 +28,7 @@ framework. bioRxiv (2026) doi:10.64898/2026.03.17.712115](https://www.biorxiv.or
 Use the following command to install *evedesign* with support for all currently implemented models.
 You can remove any of the options if you do not need the respective model. Please see specific instructions for Boltz-2 further below.
 ```
-pip install evedesign[evmutation2,esm2,mpnn,umap,gpytorch] 
+pip install evedesign[evmutation2,esm2,mpnn,umap,gpytorch,eve,promb] 
 ```
 
 ### Boltz2 installation 
@@ -55,6 +55,26 @@ are overridden in `[tool.uv]` in `pyproject.toml`, and pip does not honor those 
 
 For CPU/MPS-only use (no CUDA), install the `boltz2fold` extra instead of `boltz2fold-cuda`.
 
+### BoltzGen installation
+
+For *de novo* structure generation with BoltzGen (CUDA 12 only — there is no
+CPU or macOS path):
+```bash
+uv pip install evedesign[boltzgen]
+```
+
+The extra is only needed to install BoltzGen *alongside* evedesign. evedesign
+invokes the `boltzgen` CLI as a subprocess, so if you already have it in a
+separate environment, skip the extra and point at that executable:
+```python
+BoltzGenGenerator(binary="/path/to/other/env/bin/boltzgen")
+```
+
+**uv is required if you want BoltzGen and Boltz-2 in the same environment**:
+BoltzGen pins `numpy==2.0.2` and `numba==0.61.0`, which conflict with Boltz-2's
+requirements and are overridden in `[tool.uv]` in `pyproject.toml`. pip does not
+honor those overrides.
+
 ## Getting started
 
 Please refer to some of our [examples](examples) how to use *evedesign*. We are continuously extending these as new 
@@ -72,16 +92,25 @@ We are happy to help if you have any questions!
 
 ### Biomolecular models, embedders and restraints
 
-| Name                        | Class                                                  | Interfaces                           | 
-|-----------------------------|--------------------------------------------------------|--------------------------------------|
-| EVmutation2                 | `evedesign.models.evmutation2.EVmutation2`             | `Generator`, `Scorer`, `Transformer` |
-| LigandMPNN/ProteinMPNN      | `evedesign.models.mpnn.LigandMPNN`                     | `Generator`, `Scorer`                |
-| ESM-2                       | `evedesign.models.esm2.ESM2`                           | `Transformer` `Scorer`               |
-| Boltz-2                     | `evedesign.models.boltzfold.BoltzFoldTransformer`      | `Transformer`, `Scorer`              |
-| EVcouplings                 | `evedesign.models.evcouplings.EVcouplings`             | `Scorer`                             |
-| Sequence distance restraint | `evedesign.restraints.seq_dist.LinearSeqDistRestraint` | `Scorer`                             |
-| One-hot encoding embedder   | `evedesign.models.embedders.OneHotEmbedder`            | `Transformer`                        |
-| BLOSUM embedder             | `evedesign.models.embedders.BLOSUMEmbedder`            | `Transformer`                        |
+Note that most methods listed as `Scorer` also support the `MutationScorer` and `ConditionalMutationScorer` interfaces. 
+
+| Name                        | Class                                                            | Interfaces                           | 
+|-----------------------------|------------------------------------------------------------------|--------------------------------------|
+| EVmutation2                 | `evedesign.models.evmutation2.EVmutation2`                       | `Generator`, `Scorer`, `Transformer` |
+| LigandMPNN/ProteinMPNN      | `evedesign.models.mpnn.LigandMPNN`                               | `Generator`, `Scorer`                |
+| ESM-2                       | `evedesign.models.esm2.ESM2`                                     | `Transformer` `Scorer`               |
+| Boltz-2                     | `evedesign.models.boltzfold.BoltzFoldTransformer`                | `Transformer`, `Scorer`              |
+| BoltzGen                    | `evedesign.models.boltzgen.BoltzGenGenerator`          | `Generator`                          |
+| EVcouplings                 | `evedesign.models.evcouplings.EVcouplings`                       | `Scorer`                             |
+| EVE                         | `evedesign.models.eve.EVE`                                       | `Scorer`                             |
+| MixMHC2pred                 | `evedesign.models.immunogenicity.MixMHC2Pred`                    | `Scorer`                             |
+| promb/OASis humanness       | `evedesign.models.oasis_humanness.OASisHumanness`                | `Scorer`                             |
+| One-hot encoding embedder   | `evedesign.models.embedders.OneHotEmbedder`                      | `Transformer`                        |
+| BLOSUM embedder             | `evedesign.models.embedders.BLOSUMEmbedder`                      | `Transformer`                        |
+| Sequence distance restraint | `evedesign.restraints.seq_dist.LinearSeqDistRestraint`           | `Scorer`                             |
+| Exposed sequence motifs     | `evedesign.restraints.motif.ExposedMotifRestraint`               | `Scorer`                             |
+| Isoelectric point restraint | `evedesign.restraints.physicochemical.IsoelectricPointRestraint` | `Scorer`                             |
+| Molecular weight restraint  | `evedesign.restraints.physicochemical.MolecularWeightRestraint`  | `Scorer`                             |
 
 ### Supervised models
 
@@ -92,9 +121,9 @@ We are happy to help if you have any questions!
 
 ### Samplers
 
-| Name          | Class                                  | Interfaces  | 
-|---------------|----------------------------------------|-------------|
-| Gibbs sampler |`evedesign.samplers.gibbs.GibbsSampler` | `Generator` |
+| Name          | Class                                   | Interfaces  | 
+|---------------|-----------------------------------------|-------------|
+| Gibbs sampler | `evedesign.samplers.gibbs.GibbsSampler` | `Generator` |
 
 ### Analyzers
 
@@ -115,7 +144,7 @@ We are happy to help if you have any questions!
 ## Roadmap and contributing
 
 We plan to continuously add more models, restraints, oracles and samplers to the framework, e.g. *de novo* 3D structure generation
-with BoltzGen or BindCraft. 
+with BindCraft. 
 
 We are actively looking for further contributors to develop our framework jointly with the community. 
 If you are interested or feel like an important model is missing from the framework, please get in contact with us!

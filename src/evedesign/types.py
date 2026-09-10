@@ -10,6 +10,8 @@ SecondaryStructureType = Literal["H", "E", "C"]  # helix, sheet, coil
 SymmetryType = Literal["C", "D", "T", "O", "I"]
 DeviceType = Literal["cpu", "cuda", "mps"]
 BatchSize = int | Literal["auto"] | None
+SiteType = Literal["t_cell_epitope", "liability_motif"]
+
 
 class DesignChain(TypedDict):
     # mapping from entity to
@@ -18,12 +20,24 @@ class DesignChain(TypedDict):
     # tuple: entity, position, new symbol, score difference, temperature
     chain: list[tuple[int, int, str, float, float]]
 
+
 class Score(TypedDict):
     index: int
     name: str
     weight: float
     score: float
     ref_score: float | None
+
+
+class Site(TypedDict):
+    entity: int
+    pos: int
+    length: int
+    type: SiteType  # e.g. t_cell_epitope
+    subtype: str   # e.g. HLA allele
+    score: float | None  # e.g. HLA prediction rank
+    weight: float | None  # e.g. population weight
+
 
 SCORE_COMPONENT_KEY = "scores"
 CHAIN_COMPONENT_KEY = "design_chain"
@@ -33,6 +47,7 @@ class Metadata(TypedDict):
     scores: NotRequired[list[Score]]
     design_chain: NotRequired[DesignChain]
     seqspace_projection: NotRequired[list[float]]
+    sites: NotRequired[list[Site]]
 
 
 class SequenceMetadata(TypedDict):
