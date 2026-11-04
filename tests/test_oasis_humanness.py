@@ -10,7 +10,7 @@ from evedesign.system import (
     Mutation,
     Protein,
     System,
-    SystemInstance,
+    SystemInstance, DNA,
 )
 
 
@@ -40,7 +40,7 @@ def test_can_model_accepts_protein_only_systems_without_sequences():
     assert valid, reason
 
     valid, reason = OASisHumanness.can_model(
-        System([Entity(type="dna", rep="AAAAAAAAA", first_index=1)])
+        System([DNA(rep="AAAAAAAAA", first_index=1)])
     )
     assert not valid
     assert "protein" in reason
