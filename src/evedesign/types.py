@@ -40,9 +40,33 @@ class Site(TypedDict):
     model: NotRequired[str]  # model that identified the site
 
 
+class StructureComparison(TypedDict):
+    reference: NotRequired[str]  # key in Entity.structures (e.g. PDB id)
+    model: NotRequired[str]  # key in EntityInstance.models (e.g. "model_0")
+    subset: str  # "all" or name of residue subset
+    superposition: str  # subset used for superposition
+    atoms: list[str]  # atom names used for superposition/RMSD
+    num_atoms: int
+    rmsd: float
+    tm_score: float | None  # only computed for full comparison
+    copy_assignment: dict[str, list[int]]  # entity -> model copy index per reference copy
+    transform: list[list[float]]  # 4x4 matrix applied to model coordinates
+
+
+class PositionRecovery(TypedDict):
+    subset: str  # name of position set
+    num_positions: int
+    num_maintained: int
+    fraction: float | None  # num_maintained / num_positions (None for empty set)
+    mutated: list[list[int | str]]  # [entity, pos, WT residue, design residue ("-" if deleted)]
+
+
 SCORE_COMPONENT_KEY = "scores"
 CHAIN_COMPONENT_KEY = "design_chain"
 SEQSPACE_PROJECTION_COMPONENT_KEY = "seqspace_projection"
+STRUCTURE_COMPARISON_COMPONENT_KEY = "structure_comparison"
+POSITION_RECOVERY_COMPONENT_KEY = "position_recovery"
+
 
 class Metadata(TypedDict):
     scores: NotRequired[list[Score]]

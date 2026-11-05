@@ -128,12 +128,14 @@ Note that most methods listed as `Scorer` also support the `MutationScorer` and 
 
 ### Analyzers
 
-| Name                                   | Class                                                         | Interfaces   | 
-|----------------------------------------|---------------------------------------------------------------|--------------|
-| UMAP sequence space projection         | `evedesign.analyzers.sequence_space.SequenceSpaceUMAP`        | `Analyzer`   |
-| MDS sequence space projection          | `evedesign.analyzers.sequence_space.SequenceSpaceMDS`         | `Analyzer`   |
-| Landmark MDS sequence space projection | `evedesign.analyzers.sequence_space.SequenceSpaceLandmarkMDS` | `Analyzer`   |
-| PCA sequence space projection          | `evedesign.analyzers.sequence_space.SequenceSpacePCA`         | `Analyzer`   |
+| Name                                   | Class                                                                   | Interfaces   | 
+|----------------------------------------|-------------------------------------------------------------------------|--------------|
+| UMAP sequence space projection         | `evedesign.analyzers.sequence_space.SequenceSpaceUMAP`                  | `Analyzer`   |
+| MDS sequence space projection          | `evedesign.analyzers.sequence_space.SequenceSpaceMDS`                   | `Analyzer`   |
+| Landmark MDS sequence space projection | `evedesign.analyzers.sequence_space.SequenceSpaceLandmarkMDS`           | `Analyzer`   |
+| PCA sequence space projection          | `evedesign.analyzers.sequence_space.SequenceSpacePCA`                   | `Analyzer`   |
+| Reference 3D structure comparison      | `evedesign.analyzers.structure_comparison.ReferenceStructureComparison` | `Analyzer`   |
+| Fixed sequence position recovery       | `evedesign.analyzers.position_recovery.FixedPositionRecovery`           | `Analyzer`   |
 
 ### Nucleotide sequence generation
 
