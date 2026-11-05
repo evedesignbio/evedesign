@@ -37,6 +37,7 @@ class Site(TypedDict):
     subtype: str   # e.g. HLA allele
     score: float | None  # e.g. HLA prediction rank
     weight: float | None  # e.g. population weight
+    model: NotRequired[str]  # model that identified the site
 
 
 SCORE_COMPONENT_KEY = "scores"
