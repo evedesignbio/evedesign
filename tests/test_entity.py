@@ -1,8 +1,9 @@
-from evedesign.system import System, Entity, SystemInstance, EntityInstance
+from evedesign.system import System, Entity, DNA, SystemInstance, EntityInstance, Protein, Ligand
+
 
 def test_system_validation():
     system = System([
-        Entity(type="dna", rep="AATT", first_index=1)
+        DNA(rep="AATT", first_index=1)
     ])
 
     # check length verification
@@ -31,7 +32,7 @@ def test_system_validation():
 
 
 def test_apply_instance_takes_rep_from_instance():
-    system = System([Entity(type="protein", rep="ACDE", first_index=5)])
+    system = System([Protein(rep="ACDE", first_index=5)])
     updated = system.apply_instance(
         SystemInstance([EntityInstance(rep="WYFG")])
     )
@@ -42,7 +43,7 @@ def test_apply_instance_takes_rep_from_instance():
 
 
 def test_apply_instance_normalizes_inserts_and_deletions():
-    system = System([Entity(type="protein", rep="ACDE", first_index=1)])
+    system = System([Protein(rep="ACDE", first_index=1)])
     updated = system.apply_instance(
         SystemInstance([EntityInstance(rep="AaC-E")])
     )
@@ -54,8 +55,8 @@ def test_apply_instance_normalizes_inserts_and_deletions():
 def test_apply_instance_keeps_ligand_rep_type():
     # ligand_rep_type is mandatory for ligands, so dropping it raised
     system = System([
-        Entity(type="protein", rep="ACDE", first_index=1),
-        Entity(type="ligand", rep="CCO", ligand_rep_type="smiles"),
+        Protein(rep="ACDE", first_index=1),
+        Ligand(rep="CCO", ligand_rep_type="smiles"),
     ])
     updated = system.apply_instance(SystemInstance([
         EntityInstance(rep="WYFG"),
@@ -67,7 +68,7 @@ def test_apply_instance_keeps_ligand_rep_type():
 
 def test_apply_instance_falls_back_to_entity_rep():
     # EntityInstance.rep is None when only a backbone is available
-    system = System([Entity(type="protein", rep="ACDE", first_index=1)])
+    system = System([Protein(rep="ACDE", first_index=1)])
     updated = system.apply_instance(
         SystemInstance([EntityInstance(rep=None)])
     )

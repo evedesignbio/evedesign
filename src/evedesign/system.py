@@ -3,16 +3,16 @@ Specification of components of molecular design system (proteins, nucleic acids,
 """
 from collections import UserList
 from collections.abc import Sequence
-from copy import deepcopy
+from copy import deepcopy, copy
 from io import StringIO
 from math import isclose
-from typing import NamedTuple, Self, Any
+from typing import NamedTuple, Self, Any, ClassVar
 import numpy as np
 
 from evedesign.sequence import valid_sequence, Sequences
 from evedesign.structure import Structure, StructureFile
 from evedesign.types import (
-    EntityType, Metadata, BioPolymers, RepSequence, LigandRepType, SymmetryType, BondType,
+    EntityType, Metadata, RepSequence, LigandRepType, SymmetryType, BondType,
     SecondaryStructureType, Embedding
 )
 from evedesign.constants import (
@@ -623,187 +623,92 @@ class Insertion:
 
 
 class Entity:
+    _entity_type: ClassVar[EntityType | None] = None
+
+    # Registry mapping entity type string to concrete subclass, for deserialization
+    _registry: ClassVar[dict[str, type["Entity"]]] = {}
+
+    def __init_subclass__(cls, **kwargs):
+        super().__init_subclass__(**kwargs)
+        entity_type = cls.__dict__.get("_entity_type")
+        if entity_type is not None:
+            Entity._registry[entity_type] = cls
+
     def __init__(
         self,
-        type: EntityType,  # noqa
         rep: str | RepSequence | None = None,
         id: str | None = None,  # noqa
-        first_index: int | None = None,
-        sequences: Sequences | None = None,
         structures: StructureChainMap | None = None,
-        ligand_rep_type: LigandRepType | None = None,
         interactions: Sequence[Interaction] | None = None,
         atom_bonds: Sequence[AtomBond] | None = None,
-        modifications: Sequence[Modification] | None = None,
         copies: int | None = None,
         symmetry: SymmetryType | None = None,
-        secondary_structure: Sequence[SecondaryStructure] | None = None,
-        cyclic: bool | None = None,
-        min_length: int | None = None,
-        max_length: int | None = None,
-        residue_bias: Sequence[ResidueBias] | None = None,
-        insertions: Sequence[Insertion] | None = None,
-        deletions: bool | None = None,
     ):
         """
         Create new generic entity for molecular system.
 
-        Note: For clarity, preferentially use subclasses for specific types
-        of entities (e.g. Protein class)
-
-        Note: Equality does not check sequences and structures
+        Note: Class is not meant to be instantiated directly, use actual entity type subclasses
+        (Protein, DNA, RNA, Ligand)
 
         Parameters
         ----------
-        type
-            Type of entity (protein, nucleotide, ligand, ...)
         id
             Unique identifier of entity
         rep
             Representation of entity (sequence, atom name, etc.)
-        first_index
-            Sequence index of first residue; must be specified
-            for polymer types (protein, nucleotide, ...)
-        sequences
-            Sequence record (e.g. multiple sequence alignment of homologs) of the target
-            sequence represented by this entity (only applies to proteins and nucleotides)
         structures
             Structure chains representing this entity. Use dict with structure identifiers
             as keys to supply multiple different structures; use list to supply multiple copies
             of the chain within the structure (homooligomer)
-        ligand_rep_type
-            Type of ligand rep specification (ligands only)
         interactions
             Positive/negative interactions within and between entities
         atom_bonds:
             Defined interactions between pairs of atoms
-        modifications:
-            Biopolymer residue modifications (must be None for ligand)
         copies
             Number of entity copies in molecular system. Set to None
             to leave variable.
         symmetry:
             Type of structural symmetry (cyclic, dihedral, tetrahedral, ...)
             entity should assume, must be specified together with copies attribute
-        secondary_structure:
-            Secondary structure assignment per position or globally
-        cyclic:
-            If True, make biopolymer cyclic (must be None for ligands)
-        min_length:
-            Minimum length of designed polymer sequence (inclusive), must be None
-            for ligand entities
-        max_length:
-            Maximum length of designed polymer sequence (inclusive), must be None
-            for ligand entities
-        residue_bias:
-            Modify positional or global amino acid/nucleotide base preferences. Preferences evaluated in order of list
-            (later entries override earlier entries)
-        insertions:
-            Insertions relative to entity base sequence (must be None for ligands)
-        deletions:
-            If True, allow deletion of fixed-length positions from rep defined on entity.
-            Must be None for ligand entities.
         """
-        self.type = type
+        if self._entity_type is None:
+            raise ValueError(
+                "This class should not be instantiated directly, use Protein, DNA, RNA, or Ligand"
+            )
+
+        # attributes shared over all entity types
         self.rep = _rep_to_np_array(rep)
         self.id = id
         self.copies = copies
-
-        if self.type not in BioPolymers and sequences is not None:
-            raise ValueError(
-                "Sequence record only supported for biopolymer entities"
-            )
-
-        self.sequences = sequences
         self.structures = structures
-        self.first_index = first_index
-
-        # extended attributes
-        self.ligand_rep_type = ligand_rep_type
         self.interactions = interactions
         self.atom_bonds = atom_bonds
-        self.modifications = modifications
         self.symmetry = symmetry
-        self.secondary_structure = secondary_structure
-        self.cyclic = cyclic
-        self.min_length = min_length
-        self.max_length = max_length
-        self.residue_bias = residue_bias
-        self.insertions = insertions
-        self.deletions = deletions
-
-        if self.type in BioPolymers:
-            if self.ligand_rep_type is not None:
-                raise ValueError(
-                    "ligand_rep_type can only be specified for ligand entities"
-                )
-
-            if first_index is None or first_index < 1:
-                raise ValueError(
-                    f"first_index must be specified for type {self.type} and must be >= 1"
-                )
-
-            # verify that polymer sequence is valid if specified (including mask)
-            if rep is not None:
-                # allow representative to contain gaps, may want to mutate this to AA
-                valid_seq, invalid = valid_sequence(
-                    rep, self.alphabet(
-                        include_gap=self.deletions,  # use as truth-y type
-                        include_inserts=False,
-                    ), allow_mask=True
-                )
-
-                if not valid_seq:
-                    raise ValueError(f"Invalid sequence: {invalid}")
-
-        elif self.type == "ligand":
-            if self.ligand_rep_type is None:
-                raise ValueError(
-                    "ligand_rep_type must be specified for ligand entities"
-                )
-
-            if (
-                self.first_index is not None or self.deletions or
-                self.cyclic is not None or self.min_length is not None or
-                self.max_length is not None or self.insertions is not None or
-                self.modifications is not None or self.residue_bias is not None or
-                self.sequences is not None
-            ):
-                raise ValueError(
-                    "first_index, deletions, cyclic, min_length, max_length, insertions, modifications, residue_bias "
-                    "can only be True/defined for biopolymer entities"
-                )
 
         if self.symmetry is not None and self.copies is None:
             raise ValueError(
                 "Attribute 'symmetry' must be specified together with 'copies'"
             )
 
+    @property
+    def type(self) -> EntityType | None:
+        return self._entity_type
+
     def __eq__(self, other):
         # only ever accept same class for equality
         if not isinstance(other, Entity):
             return False
 
-        # do not compare sequences and structures are these are auxiliary resources
-        # for modeling the entity
+        # compare attributes shared by all entity types;
+        # we do not compare structures
         return (
-                self.type == other.type and
-                np.all(self.rep == other.rep) and
-                self.id == other.id and
-                self.copies == other.copies and
-                self.first_index == other.first_index and
-                self.ligand_rep_type == other.ligand_rep_type and
-                self.interactions == other.interactions and
-                self.atom_bonds == other.atom_bonds and
-                self.modifications == other.modifications and
-                self.symmetry == other.symmetry and
-                self.secondary_structure == other.secondary_structure and
-                self.cyclic == other.cyclic and
-                self.min_length == other.min_length and
-                self.max_length == other.max_length and
-                self.residue_bias == other.residue_bias and
-                self.insertions == other.insertions and
-                self.deletions == other.deletions
+            self._entity_type == other._entity_type and
+            np.array_equal(self.rep, other.rep) and
+            self.id == other.id and
+            self.copies == other.copies and
+            self.interactions == other.interactions and
+            self.atom_bonds == other.atom_bonds and
+            self.symmetry == other.symmetry
         )
 
     def serialize(self) -> dict[str, Any]:
@@ -819,21 +724,10 @@ class Entity:
             "type": self.type,
             "rep": "".join(self.rep) if self.rep is not None else None,
             "copies": self.copies,
-            "first_index": self.first_index,
-            "sequences": self.sequences.serialize() if self.sequences is not None else None,
             "structures": _serialize_chain_map(self.structures),
-            "ligand_rep_type": self.ligand_rep_type,
             "interactions": _serialize_optional_list(self.interactions),
             "atom_bonds": _serialize_optional_list(self.atom_bonds),
-            "modifications": _serialize_optional_list(self.modifications),
             "symmetry": self.symmetry,
-            "secondary_structure": _serialize_optional_list(self.secondary_structure),
-            "cyclic": self.cyclic,
-            "min_length": self.min_length,
-            "max_length": self.max_length,
-            "residue_bias": _serialize_optional_list(self.residue_bias),
-            "insertions": _serialize_optional_list(self.insertions),
-            "deletions": self.deletions,
         }
 
     @classmethod
@@ -850,28 +744,83 @@ class Entity:
         -------
         Deserialized Entity instance
         """
-        sequences = entity_dict.get("sequences")
+        # check we are able to deserialize the given entity type
+        entity_type = entity_dict.get("type")
 
-        return cls(
-            type=entity_dict.get("type"),
-            rep=entity_dict.get("rep"),
-            id=entity_dict.get("id"),
-            copies=entity_dict.get("copies"),
-            first_index=entity_dict.get("first_index"),
-            sequences=Sequences.deserialize(sequences) if sequences is not None else None,
-            structures=_deserialize_chain_map(entity_dict.get("structures")),
-            ligand_rep_type=entity_dict.get("ligand_rep_type"),
-            interactions=_deserialize_optional_list(entity_dict.get("interactions"), Interaction),
-            atom_bonds=_deserialize_optional_list(entity_dict.get("atom_bonds"), AtomBond),
-            modifications=_deserialize_optional_list(entity_dict.get("modifications"), Modification),
-            symmetry=entity_dict.get("symmetry"),
-            secondary_structure=_deserialize_optional_list(entity_dict.get("secondary_structure"), SecondaryStructure),
-            cyclic=entity_dict.get("cyclic"),
-            min_length=entity_dict.get("min_length"),
-            max_length=entity_dict.get("max_length"),
-            residue_bias=_deserialize_optional_list(entity_dict.get("residue_bias"), ResidueBias),
-            insertions=_deserialize_optional_list(entity_dict.get("insertions"), Insertion),
-            deletions=entity_dict.get("deletions"),
+        if entity_type not in Entity._registry:
+            raise ValueError(
+                "Entity type '{}' not recognized".format(entity_type)
+            )
+
+        target = Entity._registry[entity_type]
+
+        # guard against recursive calls to this function
+        if target is cls:
+            raise NotImplementedError(f"No proper deserialization implemented for {entity_type}")
+
+        return target.deserialize(entity_dict)
+
+    def copy(self, deep: bool = True, **overrides) -> Self:
+        """
+        Copy the entity with optional overrides of attributes
+
+        Parameters
+        ----------
+        deep
+            If True, perform a deep copy of all non-overwritten attributes
+        overrides
+            Attributes that should be replaced on the copy (if not set on the entity,
+            will raise an AttributeError)
+
+        Returns
+        -------
+        Copy of entity with overrides applied
+        """
+        unknown = set(overrides) - set(vars(self))
+        if unknown:
+            raise AttributeError(
+                "{} has no attribute(s) {}".format(
+                    type(self).__name__, ", ".join(map(repr, sorted(unknown)))
+                )
+            )
+
+        new_entity = copy(self)
+
+        # take overridden values from caller, deep copy the rest if requested
+        for name, value in vars(self).items():
+            if name in overrides:
+                setattr(new_entity, name, overrides[name])
+            elif deep:
+                setattr(new_entity, name, deepcopy(value))
+
+        return new_entity
+
+    def with_instance(self, entity_instance: "EntityInstance") -> Self:
+        """
+        Create copy of entity with representation and structural models taken
+        from the given entity instance. Falls back to representation on the entity
+        if the instance does not define one.
+
+        Note: will drop any specifications that may include positions (interactions,
+        atom_bonds) as these may get out of sync in case of different length
+        representations
+
+        Parameters
+        ----------
+        entity_instance
+            Entity instance from which representation and models should be used
+
+        Returns
+        -------
+        Copy of entity updated from the instance
+        """
+        return self.copy(
+            rep=(
+                None if self.rep is None else self.rep.copy()
+            ) if entity_instance.rep is None else entity_instance.rep,
+            structures=entity_instance.models,
+            interactions=None,
+            atom_bonds=None,
         )
 
     def defined_sequence(self) -> bool:
@@ -888,55 +837,7 @@ class Entity:
         -------
         True if protein/nucleotide sequence with some defined length
         """
-        return (
-                self.type in BioPolymers and
-                self.rep is not None and
-                len(self.rep) > 0 and
-                self.first_index is not None and
-                valid_sequence(
-                self.rep,
-                self.alphabet(include_gap=True, include_inserts=False),
-                allow_mask=True
-            )
-        )
-
-    def alphabet(
-        self,
-        include_gap: bool=True,
-        include_inserts: bool=False
-    ) -> list[str]:
-        """
-        Return sequence alphabet for biopolymer entities
-
-        Parameters
-        ----------
-        include_gap
-            If true, add gap symbol to alphabet
-        include_inserts
-            If true, add insert symbols to alphabet (lowercase version of all symbols)
-
-        Returns
-        -------
-        Alphabet for representing primary sequence of entity
-        """
-        if self.type == "protein":
-            a = VALID_AA_OR_GAP_SORTED if include_gap else VALID_AA_SORTED
-            if include_inserts:
-                a = a + [symbol.lower() for symbol in VALID_AA_SORTED]
-        elif self.type == "dna":
-            a = VALID_DNA_OR_GAP_SORTED if include_gap else VALID_DNA_SORTED
-            if include_inserts:
-                a = a + [symbol.lower() for symbol in VALID_DNA_SORTED]
-        elif self.type == "rna":
-            a = VALID_RNA_OR_GAP_SORTED if include_gap else VALID_RNA_SORTED
-            if include_inserts:
-                a = a + [symbol.lower() for symbol in VALID_RNA_SORTED]
-        else:
-            raise NotImplementedError(
-                f"Alphabet for type {self.type} not implemented"
-            )
-
-        return a
+        return False
 
     @classmethod
     def merge_alphabet_symbols(
@@ -974,7 +875,7 @@ class Entity:
         -------
         True if biopolymer, False otherwise
         """
-        return self.type in BioPolymers
+        return False
 
     def positions(self) -> list[int]:
         """
@@ -985,45 +886,7 @@ class Entity:
         -------
         List of positions
         """
-        # first_index must be set for biopolymers, just include here to be 100% explicit about
-        # assumptions
-        if not self.type in BioPolymers or self.first_index is None or self.rep is None:
-            return []
-
-        return [
-            pos for pos, _ in enumerate(self.rep, start=self.first_index)
-        ]
-
-    def expand_residue_bias(self) -> dict[int, dict[str, float]]:
-        """
-        Expand residue bias definition into dictionary mapping all specified positions,
-        evaluating in order of residue_bias attribute (later entries overwrite
-        earlier entries)
-
-        Returns
-        -------
-        Expanded residue bias mapping
-        """
-        if self.residue_bias is None:
-            return {}
-
-        expanded = {}
-
-        for bias_entry in self.residue_bias:
-            # If pos is None, means all positions in entity
-            if bias_entry.pos is None:
-                entry_pos = self.positions()
-            else:
-                entry_pos = [bias_entry.pos]
-
-            for cur_pos in entry_pos:
-                if cur_pos not in expanded:
-                    expanded[cur_pos] = {}
-
-                for symbol, value in bias_entry.bias.items():
-                    expanded[cur_pos][symbol] = value
-
-        return expanded
+        return []
 
 
 class EntityInstance:
@@ -1410,7 +1273,7 @@ class System(UserList[Entity]):
         valid = len(self.data) == len(instance)
 
         for entity, entity_instance in zip(self.data, instance):
-            if entity.type in BioPolymers:
+            if isinstance(entity, BiopolymerEntity):
                 if fixed_length:
                     valid = valid and (
                         entity.rep is None or (
@@ -1508,8 +1371,9 @@ class System(UserList[Entity]):
                     instance[entity_idx].rep, start=entity.first_index
                 )
             } for entity_idx, entity in enumerate(self.data)
-            # only iterate defined reps for biopolymer sequences
-            if entity.type in BioPolymers and entity.first_index is not None and instance[entity_idx].rep is not None
+            # only iterate defined reps for biopolymer sequences;
+            # check via isinstance so first_index can be assumed to exist
+            if isinstance(entity, BiopolymerEntity) and entity.first_index is not None and instance[entity_idx].rep is not None
         }
 
         # also record possible positions for insertion including N-terminal of first_index
@@ -1523,8 +1387,9 @@ class System(UserList[Entity]):
                 entity_idx: set() for entity_idx, pos in entity_to_pos.items()
             }
 
+        # call to alphabet() is valid since we check for BiopolymerEntity above
         entity_to_valid_subs = {
-            entity_idx: self.data[entity_idx].alphabet(include_gap=deletions, include_inserts=insertions)
+            entity_idx: self.data[entity_idx].alphabet(include_gap=deletions, include_inserts=insertions)  # noqa
             for entity_idx in entity_to_pos
         }
 
@@ -1648,16 +1513,19 @@ class System(UserList[Entity]):
         instance: SystemInstance
     ) -> Self:
         """
-        Create new system with updated representations from given instance
-        (as shallow copy). The representation of each entity instance
-        will be normalized, i.e. deletions are removed and insertions
-        are converted into regular uppercase symbols.
+        Create new system with updated representations from given instance.
+        The representation of each entity instance will be normalized, i.e.
+        deletions are removed and insertions are converted into regular
+        uppercase symbols.
 
         Entity instances without a representation fall back to the
         representation of the corresponding system entity.
 
         Sequences attached to system will not be attached to new system,
-        structural models will be added.
+        structural models will be added. All other entity attributes are
+        carried over unchanged except for (potentially) positional attributes
+        (interactions, atom_bonds, modifications, secondary_structure, insertions,
+        and residue_bias with a defined pos) which are dropped.
 
         Assumes instance has been previously validated with valid_instance()
 
@@ -1673,20 +1541,8 @@ class System(UserList[Entity]):
         assert len(instance) == len(self.data)
 
         return type(self)([
-            Entity(
-                type=entity.type,
-                rep=(
-                    entity_instance.normalized_rep()
-                    if entity_instance.rep is not None
-                    else entity.rep
-                ),
-                id=entity.id,
-                copies=entity.copies,
-                first_index=entity.first_index,
-                ligand_rep_type=entity.ligand_rep_type,
-                sequences=None,  # do not copy sequences as we would need to realign them
-                structures=entity_instance.models
-            ) for entity, entity_instance in zip(self.data, instance)
+            entity.with_instance(entity_instance)
+            for entity, entity_instance in zip(self.data, instance)
         ])
 
     def rep_to_instance(self) -> SystemInstance:
@@ -1763,7 +1619,7 @@ class System(UserList[Entity]):
 
             # iterate mutations and update
             for mutation in reversed(mutant_sorted):
-                pos_adj = mutation.pos - self.data[mutation.entity].first_index
+                pos_adj = mutation.pos - self.data[mutation.entity].first_index  # noqa
                 if mutation.ref != "":
                     entity_to_rep[mutation.entity][pos_adj] = mutation.to
                 else:
@@ -1776,12 +1632,16 @@ class System(UserList[Entity]):
         return instances
 
 
-class _BiopolymerEntity(Entity):
+class BiopolymerEntity(Entity):
     """
-    Helper class for syntactic sugar classes Protein, DNA, RNA,
-    should never be instantiated directly.
+    Helper base class for Protein, DNA, RNA entities. Should never be instantiated directly.
+
+    Note: Equality does not check sequences and structures
     """
-    _entity_type = None
+    # per-type alphabets (upper-case symbols), set on the concrete subclasses
+    _alphabet: ClassVar[list[str]] = []
+    _alphabet_with_gap: ClassVar[list[str]] = []
+
     def __init__(
         self,
         rep: str | RepSequence | None = None,
@@ -1803,67 +1663,354 @@ class _BiopolymerEntity(Entity):
         deletions: bool = False,
     ):
         """
-        Create new biopolymer entity. Syntactic sugar for instantiating Entity class directly,
-        cf. to this class for parameter documentation.
+        Create new biopolymer entity. Should not be called directly, use Protein, DNA and RNA instead.
+
+        Parameters
+        ----------
+        id
+            Unique identifier of entity
+        rep
+            Representation of entity (sequence, atom name, etc.)
+        first_index
+            Sequence index of first residue; must be specified
+            for polymer types (protein, nucleotide, ...)
+        sequences
+            Sequence record (e.g. multiple sequence alignment of homologs) of the target
+            sequence represented by this entity (only applies to proteins and nucleotides)
+        structures
+            Structure chains representing this entity. Use dict with structure identifiers
+            as keys to supply multiple different structures; use list to supply multiple copies
+            of the chain within the structure (homooligomer)
+        interactions
+            Positive/negative interactions within and between entities
+        atom_bonds:
+            Defined interactions between pairs of atoms
+        modifications:
+            Biopolymer residue modifications
+        copies
+            Number of entity copies in molecular system. Set to None
+            to leave variable.
+        symmetry:
+            Type of structural symmetry (cyclic, dihedral, tetrahedral, ...)
+            entity should assume, must be specified together with copies attribute
+        secondary_structure:
+            Secondary structure assignment per position or globally
+        cyclic:
+            If True, make biopolymer cyclic
+        min_length:
+            Minimum length of designed polymer sequence (inclusive)
+        max_length:
+            Maximum length of designed polymer sequence (inclusive)
+        residue_bias:
+            Modify positional or global amino acid/nucleotide base preferences. Preferences evaluated in order of list
+            (later entries override earlier entries)
+        insertions:
+            Insertions relative to entity base sequence
+        deletions:
+            If True, allow deletion of fixed-length positions from rep defined on entity.
         """
         if self._entity_type is None:
             raise ValueError(
                 "Should not instantiate this class, use Protein, DNA, RNA instead"
             )
 
+        # attributes shared across all entity types
         super().__init__(
-            type=self._entity_type,
             rep=rep,
             id=id,
-            first_index=first_index,
-            sequences=sequences,
+            copies=copies,
             structures=structures,
             interactions=interactions,
             atom_bonds=atom_bonds,
-            modifications=modifications,
-            copies=copies,
-            symmetry=symmetry,
-            secondary_structure=secondary_structure,
-            cyclic=cyclic,
-            min_length=min_length,
-            max_length=max_length,
-            residue_bias=residue_bias,
-            insertions=insertions,
-            deletions=deletions,
+            symmetry=symmetry
         )
 
-class Protein(_BiopolymerEntity):
+        self.sequences = sequences
+        self.first_index = first_index
+        self.modifications = modifications
+        self.secondary_structure = secondary_structure
+        self.cyclic = cyclic
+        self.min_length = min_length
+        self.max_length = max_length
+        self.residue_bias = residue_bias
+        self.insertions = insertions
+        self.deletions = deletions
+
+        # verify first_index explicitly as this might fail in very intransparent ways downstream
+        if first_index is None or first_index < 1:
+            raise ValueError(
+                f"first_index must be specified for type {self.type} and must be >= 1"
+            )
+
+        # verify that polymer sequence is valid if specified (including mask)
+        if rep is not None:
+            # allow representative to contain gaps, may want to mutate this to AA
+            valid_seq, invalid = valid_sequence(
+                rep, self.alphabet(
+                    include_gap=self.deletions,  # use as truth-y type
+                    include_inserts=False,
+                ), allow_mask=True
+            )
+
+            if not valid_seq:
+                raise ValueError(f"Invalid sequence: {invalid}")
+
+        if self.symmetry is not None and self.copies is None:
+            raise ValueError(
+                "Attribute 'symmetry' must be specified together with 'copies'"
+            )
+
+    def __eq__(self, other):
+        # super() call ensures "other" is Entity of same _entity_type;
+        # we do not compare sequences and structures
+        return (
+            super().__eq__(other) and
+            self.first_index == other.first_index and
+            self.modifications == other.modifications and
+            self.secondary_structure == other.secondary_structure and
+            self.cyclic == other.cyclic and
+            self.min_length == other.min_length and
+            self.max_length == other.max_length and
+            self.residue_bias == other.residue_bias and
+            self.insertions == other.insertions and
+            self.deletions == other.deletions
+        )
+
+    def is_biopolymer(self) -> bool:
+        """
+        Check if entity is a biopolymer (protein, DNA, RNA)
+
+        Returns
+        -------
+        True if biopolymer, False otherwise
+        """
+        return True
+
+    def positions(self) -> list[int]:
+        """
+        Enumerate all positions in entity; will be empty
+        if not a biopolymer or rep is None
+
+        Returns
+        -------
+        List of positions
+        """
+        # first_index must be set for biopolymers, just include here to be 100% explicit about
+        # assumptions
+        if self.first_index is None or self.rep is None:
+            return []
+
+        return [
+            pos for pos, _ in enumerate(self.rep, start=self.first_index)
+        ]
+
+    def defined_sequence(self) -> bool:
+        """
+        Check if entity corresponds to a biopolymer (protein, ...)
+        and has a defined representation with non-zero length
+
+        Representation may include any valid biomolecule symbol,
+        gap (coding for deletion) and mask (coding for unspecified).
+
+        For now, not allowing inserts (lowercase symbols) in rep.
+
+        Returns
+        -------
+        True if protein/nucleotide sequence with some defined length
+        """
+        return (
+            self.rep is not None and
+            len(self.rep) > 0 and
+            self.first_index is not None and
+            valid_sequence(
+                self.rep,
+                self.alphabet(include_gap=True, include_inserts=False),
+                allow_mask=True
+            )[0]
+        )
+
+    def alphabet(
+        self,
+        include_gap: bool=True,
+        include_inserts: bool=False
+    ) -> list[str]:
+        """
+        Return sequence alphabet for biopolymer entities
+
+        Parameters
+        ----------
+        include_gap
+            If true, add gap symbol to alphabet
+        include_inserts
+            If true, add insert symbols to alphabet (lowercase version of all symbols)
+
+        Returns
+        -------
+        Alphabet for representing primary sequence of entity
+        """
+        a = self._alphabet_with_gap if include_gap else self._alphabet
+
+        if include_inserts:
+            a = a + [symbol.lower() for symbol in self._alphabet]
+
+        return a
+
+    def serialize(self) -> dict[str, Any]:
+        """
+        Serialize entity to JSON-compatible representation
+
+        Returns
+        -------
+        Serialized entity represented as dict
+        """
+        return {
+            **super().serialize(),
+            "first_index": self.first_index,
+            "sequences": self.sequences.serialize() if self.sequences is not None else None,
+            "modifications": _serialize_optional_list(self.modifications),
+            "secondary_structure": _serialize_optional_list(self.secondary_structure),
+            "cyclic": self.cyclic,
+            "min_length": self.min_length,
+            "max_length": self.max_length,
+            "residue_bias": _serialize_optional_list(self.residue_bias),
+            "insertions": _serialize_optional_list(self.insertions),
+            "deletions": self.deletions,
+        }
+
+    @classmethod
+    def deserialize(cls, entity_dict: dict[str, Any]) -> Self:
+        """
+        Deserialize entity from JSON-compatible representation to object instance
+
+        Parameters
+        ----------
+        entity_dict
+            Entity attribute map
+
+        Returns
+        -------
+        Deserialized Entity instance
+        """
+        sequences = entity_dict.get("sequences")
+
+        return cls(
+            rep=entity_dict.get("rep"),
+            id=entity_dict.get("id"),
+            copies=entity_dict.get("copies"),
+            first_index=entity_dict.get("first_index"),
+            sequences=Sequences.deserialize(sequences) if sequences is not None else None,
+            structures=_deserialize_chain_map(entity_dict.get("structures")),
+            interactions=_deserialize_optional_list(entity_dict.get("interactions"), Interaction),
+            atom_bonds=_deserialize_optional_list(entity_dict.get("atom_bonds"), AtomBond),
+            modifications=_deserialize_optional_list(entity_dict.get("modifications"), Modification),
+            symmetry=entity_dict.get("symmetry"),
+            secondary_structure=_deserialize_optional_list(entity_dict.get("secondary_structure"), SecondaryStructure),
+            cyclic=entity_dict.get("cyclic"),
+            min_length=entity_dict.get("min_length"),
+            max_length=entity_dict.get("max_length"),
+            residue_bias=_deserialize_optional_list(entity_dict.get("residue_bias"), ResidueBias),
+            insertions=_deserialize_optional_list(entity_dict.get("insertions"), Insertion),
+            deletions=entity_dict.get("deletions"),
+        )
+
+    def with_instance(self, entity_instance: "EntityInstance") -> Self:
+        """
+        Apply entity instance to entity, replacing rep and structures based on the entity instance.
+
+        Note: will drop sequences and any specifications that may include positions
+        (interactions, atom_bonds, modifications, secondary_structure, residue_bias, insertions)
+        as these may get out of sync in case of different length representations
+        """
+        return self.copy(
+            rep=(
+                (None if self.rep is None else self.rep.copy())
+                if entity_instance.rep is None
+                else entity_instance.normalized_rep()
+            ),
+            structures=entity_instance.models,
+            sequences=None,
+            interactions=None,
+            atom_bonds=None,
+            modifications=None,
+            secondary_structure=None,
+            residue_bias=None,
+            insertions=None
+        )
+
+    def expand_residue_bias(self) -> dict[int, dict[str, float]]:
+        """
+        Expand residue bias definition into dictionary mapping all specified positions,
+        evaluating in order of residue_bias attribute (later entries overwrite
+        earlier entries)
+
+        Returns
+        -------
+        Expanded residue bias mapping
+        """
+        if self.residue_bias is None:
+            return {}
+
+        expanded = {}
+
+        for bias_entry in self.residue_bias:
+            # If pos is None, means all positions in entity
+            if bias_entry.pos is None:
+                entry_pos = self.positions()
+            else:
+                entry_pos = [bias_entry.pos]
+
+            for cur_pos in entry_pos:
+                if cur_pos not in expanded:
+                    expanded[cur_pos] = {}
+
+                for symbol, value in bias_entry.bias.items():
+                    expanded[cur_pos][symbol] = value
+
+        return expanded
+
+
+class Protein(BiopolymerEntity):
     """
     Protein entity
     """
     _entity_type = "protein"
+    _alphabet = VALID_AA_SORTED
+    _alphabet_with_gap = VALID_AA_OR_GAP_SORTED
 
 
-class DNA(_BiopolymerEntity):
+class DNA(BiopolymerEntity):
     """
     DNA entity
     """
     _entity_type = "dna"
+    _alphabet = VALID_DNA_SORTED
+    _alphabet_with_gap = VALID_DNA_OR_GAP_SORTED
 
 
-class RNA(_BiopolymerEntity):
+class RNA(BiopolymerEntity):
     """
     RNA entity
     """
     _entity_type = "rna"
+    _alphabet = VALID_RNA_SORTED
+    _alphabet_with_gap = VALID_RNA_OR_GAP_SORTED
 
 
 class Ligand(Entity):
     """
-    Create ligand entity. Syntactic sugar for direct instantiation
-    of class Entity
+    Ligand entity
+
+    Note: Equality does not check structures
     """
+    _entity_type = "ligand"
+
     def __init__(
         self,
+        *,
+        ligand_rep_type: LigandRepType,
         rep: str | RepSequence | None = None,
         id: str | None = None,  # noqa
         structures: StructureChainMap | None = None,
-        ligand_rep_type: LigandRepType | None = None,
         interactions: Sequence[Interaction] | None = None,
         atom_bonds: Sequence[AtomBond] | None = None,
         copies: int | None = None,
@@ -1872,17 +2019,84 @@ class Ligand(Entity):
         """
         Create new ligand entity
 
-        Cf. Entity class documentation for parameters
+        Parameters
+        ----------
+        id
+            Unique identifier of entity
+        rep
+            Representation of entity (sequence, atom name, etc.)
+        structures
+            Structure chains representing this entity. Use dict with structure identifiers
+            as keys to supply multiple different structures; use list to supply multiple copies
+            of the chain within the structure (homooligomer)
+        ligand_rep_type
+            Type of ligand rep specification (ligands only)
+        interactions
+            Positive/negative interactions within and between entities
+        atom_bonds:
+            Defined interactions between pairs of atoms
+        copies
+            Number of entity copies in molecular system. Set to None
+            to leave variable.
+        symmetry:
+            Type of structural symmetry (cyclic, dihedral, tetrahedral, ...)
+            entity should assume, must be specified together with copies attribute
         """
         super().__init__(
-            type="ligand",
             rep=rep,
             id=id,
             structures=structures,
-            ligand_rep_type=ligand_rep_type,
             interactions=interactions,
             atom_bonds=atom_bonds,
             copies=copies,
             symmetry=symmetry
         )
 
+        # only specific attribute for ligand
+        self.ligand_rep_type = ligand_rep_type
+
+    def __eq__(self, other):
+        # super() call ensures "other" is Entity of same _entity_type;
+        # for now we do not convert between different representation types
+        # even if they might encode the same ligand
+        return super().__eq__(other) and self.ligand_rep_type == other.ligand_rep_type
+
+    def serialize(self) -> dict[str, Any]:
+        """
+        Serialize entity to JSON-compatible representation
+
+        Returns
+        -------
+        Serialized entity represented as dict
+        """
+        return {
+            # shared Entity attributes
+            **super().serialize(),
+            # specific attributes of Ligand class
+            "ligand_rep_type": self.ligand_rep_type,
+        }
+
+    @classmethod
+    def deserialize(cls, entity_dict: dict[str, Any]) -> Self:
+        """
+        Deserialize from JSON-compatible representation to Ligand instance
+
+        Parameters
+        ----------
+        entity_dict
+            Entity attribute map
+
+        Returns
+        -------
+        Deserialized Entity instance
+        """
+        return cls(
+            rep=entity_dict.get("rep"),
+            id=entity_dict.get("id"),
+            copies=entity_dict.get("copies"),
+            structures=_deserialize_chain_map(entity_dict.get("structures")),
+            ligand_rep_type=entity_dict.get("ligand_rep_type"),
+            interactions=_deserialize_optional_list(entity_dict.get("interactions"), Interaction),
+            atom_bonds=_deserialize_optional_list(entity_dict.get("atom_bonds"), AtomBond),
+            symmetry=entity_dict.get("symmetry"),
+        )

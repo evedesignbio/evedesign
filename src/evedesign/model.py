@@ -1,6 +1,6 @@
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import Self, Sequence, Any
+from typing import Self, Sequence, Any, TypeVar
 import numpy as np
 import pandas as pd
 from evedesign.dataset import LabeledInstanceDataset
@@ -973,29 +973,32 @@ class SupervisedBaseModel(BaseModel):
         pass
 
 
-def system_subset_model(model_class):
+M = TypeVar("M", bound=BaseModel)
+
+
+def system_subset_model(model_class: type[M]) -> type[M]:
     """
     Factory function to dynamically modify a model so it can seamlessly operate on a subset
     of entities in a system (e.g. to apply single-protein LLM to binder designed in complex
     of a target structure)
 
-    TODO: need to add proper type hinting here; updated signature change of build()
-      not compatible with system_subset_model(model_class: T) -> T
+    Note: because the base class is only known at runtime, the body of the inner SubsetModel
+     class cannot itself be statically type-checked against M
 
     Parameters
     ----------
     model_class
-        Model class to wrap
+        Model class to wrap (must inherit from BaseModel)
 
     Returns
     -------
-    Updated model class
+    Subclass of model_class that transparently operates on a subset of entities
     """
     # functionality added on top of model_class only makes sense if it is a model operating on systems
     if not issubclass(model_class, BaseModel):
         raise TypeError("model_class must inherit from BaseModel")
 
-    class SubsetModel(model_class):
+    class SubsetModel(model_class):  # type: ignore[misc]
         def __init__(self, **args):
             # note: we store model as attribute rather than really subclassing it
             # as this creates headaches with method resolution between child and parent class
@@ -1040,7 +1043,7 @@ def system_subset_model(model_class):
 
         @property
         def requires_gpu(self) -> bool:
-            return self.model.handles_gpu
+            return self.model.requires_gpu
 
         @property
         def supports_gpu(self) -> bool:
@@ -1069,19 +1072,29 @@ def system_subset_model(model_class):
             return self.system_full is not None
 
         def stats(self) -> ModelStats | None:
-           return self.model.stats()
+            return self.model.stats()
 
         @staticmethod
-        def _filter_system(
+        def _resolve_entity_subset(
             system: System,
-            entity_subset: Sequence[int] | None = None,
-        ) -> System:
-            for idx in entity_subset:
+            entity_subset: Sequence[int] | None,
+        ) -> list[int]:
+            subset = sorted(set(range(len(system)) if entity_subset is None else entity_subset))
+            for idx in subset:
                 if idx < 0 or idx >= len(system):
                     raise ValueError(f"Invalid entity index: {idx}")
 
+            return subset
+
+        @classmethod
+        def _filter_system(
+            cls,
+            system: System,
+            entity_subset: Sequence[int] | None = None,
+        ) -> System:
             return System([
-                system[entity_idx] for entity_idx in sorted(entity_subset)
+                system[entity_idx]
+                for entity_idx in cls._resolve_entity_subset(system, entity_subset)
             ])
 
         def _filter_instance(self, instance) -> SystemInstance:
@@ -1112,7 +1125,7 @@ def system_subset_model(model_class):
             entity_subset: Sequence[int] | None = None,
         ) -> tuple[bool, str]:
             return model_class.can_model(
-                system, data, cls._filter_system(system, entity_subset)
+                cls._filter_system(system, entity_subset), data
             )
 
         def build(
@@ -1122,9 +1135,9 @@ def system_subset_model(model_class):
             status_callback: StatusCallback | None = None,
             entity_subset: Sequence[int] | None = None,
         ) -> Self:
-            # filter system and store, also retain full system and indices for remapping
-            self.system_subset = self._filter_system(system, entity_subset)
-            self.entity_subset = sorted(entity_subset)
+            # normalize subset once (None -> all entities), then derive everything from it
+            self.entity_subset = self._resolve_entity_subset(system, entity_subset)
+            self.system_subset = System([system[idx] for idx in self.entity_subset])
             self.entity_subset_map = {
                 full_index: filt_index for filt_index, full_index in enumerate(self.entity_subset)
             }
@@ -1180,9 +1193,9 @@ def system_subset_model(model_class):
                 inst.copy() for inst in instances
             ]
 
-            for idx, inst in instances_full:
-                instances_full[idx].score = instances_filt_scored[idx].score
-                instances_full[idx].confidence = instances_filt_scored[idx].confidence
+            for inst_full, inst_filt in zip(instances_full, instances_filt_scored):
+                inst_full.score = inst_filt.score
+                inst_full.confidence = inst_filt.confidence
 
             return instances_full
 

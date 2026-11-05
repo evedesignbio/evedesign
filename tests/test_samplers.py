@@ -1,6 +1,6 @@
 from evedesign.samplers.gibbs import GibbsSampler
 from evedesign.restraints.seq_dist import LinearSeqDistRestraint
-from evedesign.system import System, Protein, Entity
+from evedesign.system import System, Protein, Entity, RNA
 
 
 def test_seq_dist_restraint_and_gibbs_sampler():
@@ -17,8 +17,8 @@ def test_seq_dist_restraint_and_gibbs_sampler():
         Protein(
             id="prot3", rep="FFFFY", first_index=200,
         ),
-        Entity(
-            type="rna", id="rna1", rep="AAAAAA", first_index=300,
+        RNA(
+            id="rna1", rep="AAAAAA", first_index=300,
         ),
     ])
 

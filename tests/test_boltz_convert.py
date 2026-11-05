@@ -7,7 +7,7 @@ from evedesign.models.boltz.convert import (
     _write_a3m, _write_csv, system_instance_to_yaml,
 )
 from evedesign.sequence import Sequence, Sequences
-from evedesign.system import Entity, EntityInstance, System, SystemInstance
+from evedesign.system import Entity, EntityInstance, System, SystemInstance, Protein
 
 # convert.py imports pyyaml, which only ships in the boltz2fold extras
 pytestmark = pytest.mark.boltz2fold
@@ -29,8 +29,7 @@ def _read_a3m(path: Path) -> list[tuple[str, str]]:
 
 
 def _entity_with_msa(rep: str, hits: list[Sequence]) -> Entity:
-    return Entity(
-        type="protein",
+    return Protein(
         rep=rep,
         id="query",
         first_index=1,
