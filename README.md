@@ -104,6 +104,7 @@ Note that most methods listed as `Scorer` also support the `MutationScorer` and 
 | EVcouplings                 | `evedesign.models.evcouplings.EVcouplings`                       | `Scorer`                             |
 | EVE                         | `evedesign.models.eve.EVE`                                       | `Scorer`                             |
 | MixMHC2pred                 | `evedesign.models.immunogenicity.MixMHC2Pred`                    | `Scorer`                             |
+| NetMHCIIpan                 | `evedesign.models.immunogenicity.NetMHCIIpan`                    | `Scorer`                             |
 | promb/OASis humanness       | `evedesign.models.oasis_humanness.OASisHumanness`                | `Scorer`                             |
 | One-hot encoding embedder   | `evedesign.models.embedders.OneHotEmbedder`                      | `Transformer`                        |
 | BLOSUM embedder             | `evedesign.models.embedders.BLOSUMEmbedder`                      | `Transformer`                        |
