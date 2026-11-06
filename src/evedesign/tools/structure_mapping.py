@@ -1,7 +1,7 @@
 from biotite.sequence.align import align_optimal, SubstitutionMatrix
 from biotite.sequence import ProteinSequence, NucleotideSequence
 from evedesign.structure import Structure
-from evedesign.system import Entity, Protein
+from evedesign.system import Entity, Protein, BiopolymerEntity
 
 
 def map_structure_chain_to_entity_pairwise(
@@ -39,7 +39,7 @@ def map_structure_chain_to_entity_pairwise(
     """
     chain.single_chain_no_inscode_or_raise()
 
-    if not entity.is_biopolymer() or not entity.defined_sequence():
+    if not isinstance(entity, BiopolymerEntity) or not entity.defined_sequence():
         raise ValueError(
             "Entity must be a biopolymer and have defined sequence to use this function"
         )

@@ -506,7 +506,7 @@ class LigandMPNN(BaseModel, Scorer, Generator, MutationScorer, ConditionalMutati
         bias_tensor = torch.zeros(
             [L, 21], device=self.device, dtype=torch.float32
         )
-        for entity_idx, entity in enumerate(self.system):
+        for entity_idx, entity in self.system.biopolymers():
             expanded_bias = entity.expand_residue_bias()
             for entity_pos, bias_map in expanded_bias.items():
                 if (entity_idx, entity_pos) not in self._entity_pos_to_pdb_mapping:
