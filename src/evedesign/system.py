@@ -1577,7 +1577,7 @@ class System(UserList[Entity]):
             for entity, entity_instance in zip(self.data, instance)
         ])
 
-    def rep_to_instance(self) -> SystemInstance:
+    def rep_to_instance(self, require_reps: bool = False) -> SystemInstance:
         """
         Transform system into its own system instance
         (e.g. for scoring WT sequence that design was started from),
@@ -1586,6 +1586,11 @@ class System(UserList[Entity]):
         Note: Not all systems can be transformed into a valid
          system instance, e.g. if mask or gap characters are present.
          In these cases, a ValueError will be raised via valid_instance().
+
+        Parameters
+        ----------
+        require_reps
+            Set to True if all entities must have a defined rep
 
         Returns
         -------
@@ -1596,7 +1601,7 @@ class System(UserList[Entity]):
             for entity in self.data
         ])
 
-        self.valid_instance(instance, raise_invalid=True)
+        self.valid_instance(instance, require_reps=require_reps, raise_invalid=True)
 
         return instance
 

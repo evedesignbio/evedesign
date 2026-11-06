@@ -1086,7 +1086,7 @@ def system_subset_model(model_class: type[M]) -> type[M]:
             return self.model.optional_entity_attributes
 
         @property
-        def ready(self) -> str:
+        def ready(self) -> bool:
             # implies all other relevant attributes were set by build()
             return self.system_full is not None
 

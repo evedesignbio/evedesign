@@ -524,7 +524,7 @@ class GibbsSampler(Generator):
 
         # check if we can use system rep to normalize the scores to a shared reference
         try:
-            ref_instance = self.system.rep_to_instance()
+            ref_instance = self.system.rep_to_instance(require_reps=True)
             instances_with_ref = [ref_instance] + instances
         except ValueError:
             ref_instance = None
