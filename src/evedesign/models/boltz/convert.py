@@ -16,7 +16,7 @@ import json
 from loguru import logger
 
 from evedesign.models.boltz.chains import _get_chain_ids
-from evedesign.system import Entity, EntityInstance, System, SystemInstance, StructureChainMap, Structure
+from evedesign.system import EntityInstance, System, SystemInstance, StructureChainMap, Structure, BiopolymerEntity
 from evedesign.sequence import Sequence, Sequences
 from evedesign.structure import StructureFile
 from evedesign.types import Score, RepSequence
@@ -90,7 +90,7 @@ def _hits_fit_query(
 # A3M writer
 # a3m format is a simple extension of FASTA that allows for insertions in the MSA.
 def _write_a3m(
-    entity: Entity,
+    entity: BiopolymerEntity,
     entity_instance: EntityInstance,
     output_path: Path,
     old_query: str | RepSequence | None = None,
@@ -161,7 +161,7 @@ def _write_a3m(
 
 
 def _write_csv(
-    entity: Entity,
+    entity: BiopolymerEntity,
     entity_instance: EntityInstance,
     output_path: Path,
     old_query: str | RepSequence | None = None,
@@ -228,7 +228,7 @@ def _write_csv(
 
 
 def _resolve_msa_field(
-    entity: Entity,
+    entity: BiopolymerEntity,
     entity_instance: EntityInstance,
     chain_id: str,
     yaml_path: Path,
@@ -325,6 +325,7 @@ def system_instance_to_yaml(
 
         seq = "".join(entity_instance.rep)
 
+        assert isinstance(entity, BiopolymerEntity)
         msa = _resolve_msa_field(
             entity, entity_instance, first_chain, output_path,
             use_msa=use_msa,
@@ -445,6 +446,7 @@ def prediction_to_instance(
                 continue
             entity_idx = chain_to_entity[chain_id]
             entity = system[entity_idx]
+            assert isinstance(entity, BiopolymerEntity)
 
             chain_structure = full_structure.get_chain(chain_id)
 
