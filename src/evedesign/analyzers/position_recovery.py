@@ -5,7 +5,7 @@ relative to a wild-type (WT) sequence
 from typing import Mapping, Sequence, TypedDict
 
 from evedesign.analysis import Analyzer
-from evedesign.analyzers.structure_comparison import instance_to_entity_positions
+from evedesign.analyzers.structure_comparison import entity_sequence, instance_to_entity_positions
 from evedesign.constants import GAP
 from evedesign.system import System, SystemInstance
 from evedesign.types import PositionRecovery, POSITION_RECOVERY_COMPONENT_KEY
@@ -55,28 +55,35 @@ class FixedPositionRecovery(Analyzer):
         -------
         Unchanged system and shallow copies of instances with updated metadata
         """
-        data = data or {}
+        if data is None:
+            raise ValueError("data['positions'] must define at least one position set")
         if unknown := set(data) - {"positions", "reference"}:
             raise ValueError(f"Unknown keys in data: {sorted(unknown)}; allowed are 'positions', 'reference'")
-        if not data.get("positions"):
+        position_data = data.get("positions")
+        if not position_data:
             raise ValueError("data['positions'] must define at least one position set")
 
+        # duplicates removed (order kept) so each position counts once
         position_sets = {
-            name: [(int(e), int(p)) for e, p in positions if entity is None or int(e) == entity]
-            for name, positions in data["positions"].items()
+            name: list(dict.fromkeys((int(e), int(p)) for e, p in positions if entity is None or int(e) == entity))
+            for name, positions in position_data.items()
         }
         entities = sorted({e for positions in position_sets.values() for e, _ in positions})
 
-        # WT residue per (entity, position)
+        # WT residue per (entity, position): entity rep, or reference sequence if given
         reference = data.get("reference") or {}
-        wt = {}
+        polymers, wt = {}, {}
         for e in entities:
-            if not 0 <= e < len(system) or not system[e].positions():
-                raise ValueError(f"Entity {e} not in system or has no defined sequence")
-            seq = reference.get(e, system[e].rep)
-            if len(seq) != len(system[e].rep):
-                raise ValueError(f"Reference for entity {e} has length {len(seq)}, entity has {len(system[e].rep)}")
-            wt[e] = dict(zip(system[e].positions(), map(str, seq)))
+            if not 0 <= e < len(system):
+                raise ValueError(f"Entity {e} not in system")
+            polymers[e] = system.biopolymer(e)
+            wt[e] = entity_sequence(polymers[e])
+            seq = reference.get(e)
+            if seq is not None:
+                if len(seq) != len(wt[e]):
+                    raise ValueError(f"Reference for entity {e} has length {len(seq)}, entity has {len(wt[e])}")
+                # uppercase to match design residues (only uppercase instance symbols map to positions)
+                wt[e] = dict(zip(wt[e], (str(symbol).upper() for symbol in seq)))
 
         for name, positions in position_sets.items():
             if invalid := [(e, p) for e, p in positions if p not in wt[e]]:
@@ -86,11 +93,12 @@ class FixedPositionRecovery(Analyzer):
         for inst in instances:
             # design residue per (entity, entity position); deleted positions are absent
             design = {}
-            for e in entities:
-                if inst[e].rep is None:
+            for e, polymer in polymers.items():
+                instance_rep = inst[e].rep
+                if instance_rep is None:
                     raise ValueError(f"Instance {inst.id}: rep of entity {e} not defined")
-                for inst_pos, entity_pos in instance_to_entity_positions(system[e], inst[e]).items():
-                    design[(e, entity_pos)] = str(inst[e].rep[inst_pos - system[e].first_index])
+                for inst_pos, entity_pos in instance_to_entity_positions(polymer, inst[e]).items():
+                    design[(e, entity_pos)] = str(instance_rep[inst_pos - polymer.first_index])
 
             inst = inst.copy()
             inst.metadata = inst.metadata or {}
@@ -99,7 +107,7 @@ class FixedPositionRecovery(Analyzer):
                 if r["subset"] not in position_sets
             ]
             for name, positions in position_sets.items():
-                mutated = [
+                mutated: list[list[int | str]] = [
                     [e, p, wt[e][p], design.get((e, p), GAP)]
                     for e, p in positions if design.get((e, p), GAP) != wt[e][p]
                 ]

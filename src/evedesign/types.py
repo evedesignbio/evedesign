@@ -1,4 +1,4 @@
-from typing import Literal, Callable, Any, TypedDict, NotRequired, Mapping, Sequence
+from typing import Literal, Callable, Any, TypedDict, NotRequired, Mapping, Sequence, Final
 import numpy as np
 
 BioPolymers = {"protein", "dna", "rna"}
@@ -61,11 +61,11 @@ class PositionRecovery(TypedDict):
     mutated: list[list[int | str]]  # [entity, pos, WT residue, design residue ("-" if deleted)]
 
 
-SCORE_COMPONENT_KEY = "scores"
-CHAIN_COMPONENT_KEY = "design_chain"
-SEQSPACE_PROJECTION_COMPONENT_KEY = "seqspace_projection"
-STRUCTURE_COMPARISON_COMPONENT_KEY = "structure_comparison"
-POSITION_RECOVERY_COMPONENT_KEY = "position_recovery"
+SCORE_COMPONENT_KEY: Final = "scores"
+CHAIN_COMPONENT_KEY: Final = "design_chain"
+SEQSPACE_PROJECTION_COMPONENT_KEY: Final = "seqspace_projection"
+STRUCTURE_COMPARISON_COMPONENT_KEY: Final = "structure_comparison"
+POSITION_RECOVERY_COMPONENT_KEY: Final = "position_recovery"
 
 
 class Metadata(TypedDict):
@@ -73,6 +73,8 @@ class Metadata(TypedDict):
     design_chain: NotRequired[DesignChain]
     seqspace_projection: NotRequired[list[float]]
     sites: NotRequired[list[Site]]
+    structure_comparison: NotRequired[list[StructureComparison]]
+    position_recovery: NotRequired[list[PositionRecovery]]
 
 
 class SequenceMetadata(TypedDict):
