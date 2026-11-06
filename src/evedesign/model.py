@@ -117,6 +117,7 @@ class _Core(ABC):
                 "No system present on model"
             )
 
+        source: System | SystemInstance
         if instance is None:
             source = self.system
         else:
@@ -125,14 +126,8 @@ class _Core(ABC):
         return [
             (entity_idx, pos)
             for entity_idx, entity in self.system.biopolymers()
-            for pos, _ in enumerate(
-                source[entity_idx].rep,
-                start=entity.first_index
-            )
-            if (
-                entity.first_index is not None and
-                source[entity_idx].rep is not None
-            )
+            if (rep := source[entity_idx].rep) is not None
+            for pos, _ in enumerate(rep, start=entity.first_index)
         ]
 
     def valid_positions(
@@ -201,6 +196,11 @@ class _Core(ABC):
         instances: Sequence[SystemInstance],
         raise_invalid: bool = True,
     ) -> bool:
+        if self.system is None:
+            raise ValueError(
+                "No system present on model"
+            )
+
         valid = [
             self.system.valid_instance(
                 instance,
@@ -446,6 +446,11 @@ class ConditionalMutationScorer(_Core, ABC):
                 "Sequences for instances, entities and positions must all have same length"
             )
 
+        if self.system is None:
+            raise ValueError(
+                "No system present on model"
+            )
+
         # validate instance sequences with specific requirements for this class
         self._validate_instances(instances)
 
@@ -592,6 +597,11 @@ class MutationScorer(_Core, ABC):
         Columns must be in same order as returned by Entity.alphabet(); missing predictions must
         be coded by np.nan.
         """
+        if self.system is None:
+            raise ValueError(
+                "No system present on model"
+            )
+
         if positions is not None:
             if entity is None:
                 raise ValueError(
@@ -709,6 +719,11 @@ class MutationScorer(_Core, ABC):
         if hasattr(self, "ready_or_raise"):
             self.ready_or_raise()
 
+        if self.system is None:
+            raise ValueError(
+                "No system present on model"
+            )
+
         # check instance against molecular system
         self._validate_instances([instance])
 
@@ -822,7 +837,7 @@ class BaseModel(_Core):
     @property
     @abstractmethod
     # indicates if model was built and is ready for scoring/generation
-    def ready(self) -> str:
+    def ready(self) -> bool:
         pass
 
     def ready_or_raise(self) -> None:
@@ -1275,6 +1290,11 @@ def system_subset_model(model_class: type[M]) -> type[M]:
             mutants: Sequence[Mutant],
             status_callback: StatusCallback | None = None
         ) -> list[SystemInstance]:
+            if self.system is None:
+                raise ValueError(
+                    "No system present on model"
+                )
+
             self.ready_or_raise()
             self._validate_instances([instance])
 

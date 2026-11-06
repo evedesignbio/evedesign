@@ -230,7 +230,7 @@ class Interaction:
             id=interaction_dict["id"],
             pos=interaction_dict.get("pos"),
             partner_ids=interaction_dict.get("partner_ids"),
-            avoid=interaction_dict.get("avoid"),
+            avoid=interaction_dict.get("avoid", False),
         )
 
 
@@ -731,7 +731,7 @@ class Entity:
         }
 
     @classmethod
-    def deserialize(cls, entity_dict: dict[str, Any]) -> Self:
+    def deserialize(cls, entity_dict: dict[str, Any]) -> "Entity":
         """
         Deserialize entity from JSON-compatible representation to object instance
 
@@ -1314,14 +1314,14 @@ class System(UserList[Entity]):
                     )
 
                 if (validate_reps and entity_instance.rep is not None) or require_reps:
-                    is_valid_seq, _ = entity_instance.rep is not None and valid_sequence(
+                    is_valid_seq = entity_instance.rep is not None and valid_sequence(
                         entity_instance.rep,
                         entity.alphabet(
                             include_gap=allow_deletions,
                             include_inserts=not fixed_length
                         ),
                         allow_mask=False,
-                    )
+                    )[0]
 
                     valid = valid and is_valid_seq
 
@@ -1592,7 +1592,8 @@ class System(UserList[Entity]):
         System instance derived from system representation
         """
         instance = SystemInstance([
-            EntityInstance(rep=entity.rep.copy()) for entity in self.data
+            EntityInstance(rep=entity.rep.copy() if entity.rep is not None else None)
+            for entity in self.data
         ])
 
         self.valid_instance(instance, raise_invalid=True)
@@ -1651,7 +1652,7 @@ class System(UserList[Entity]):
 
             # iterate mutations and update
             for mutation in reversed(mutant_sorted):
-                pos_adj = mutation.pos - self.data[mutation.entity].first_index  # noqa
+                pos_adj = mutation.pos - self.biopolymer(mutation.entity).first_index
                 if mutation.ref != "":
                     entity_to_rep[mutation.entity][pos_adj] = mutation.to
                 else:
@@ -1910,7 +1911,7 @@ class BiopolymerEntity(Entity):
         }
 
     @classmethod
-    def deserialize(cls, entity_dict: dict[str, Any]) -> "Entity":
+    def deserialize(cls, entity_dict: dict[str, Any]) -> Self:
         """
         Deserialize entity from JSON-compatible representation to object instance
 
@@ -1929,7 +1930,7 @@ class BiopolymerEntity(Entity):
             rep=entity_dict.get("rep"),
             id=entity_dict.get("id"),
             copies=entity_dict.get("copies"),
-            first_index=entity_dict["first_index"],
+            first_index=entity_dict.get("first_index", 1),
             sequences=Sequences.deserialize(sequences) if sequences is not None else None,
             structures=_deserialize_chain_map(entity_dict.get("structures")),
             interactions=_deserialize_optional_list(entity_dict.get("interactions"), Interaction),
