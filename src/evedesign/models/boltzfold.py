@@ -417,7 +417,7 @@ class BoltzFoldTransformer(BaseModel, Transformer, Scorer):
         self,
         instances: Sequence[SystemInstance],
         status_callback: StatusCallback | None = None,
-    ) -> np.ndarray[tuple[int], np.dtype[float]]:  # type: ignore
+    ) -> list[SystemInstance]:
         """
         Run Boltz-2 prediction for each instance and
         return an array of confidence scores.
@@ -435,4 +435,3 @@ class BoltzFoldTransformer(BaseModel, Transformer, Scorer):
         return assign_scores_to_instances(
             instances, [inst.score for inst in transformed]
         )
-
