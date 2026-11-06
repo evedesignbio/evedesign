@@ -104,6 +104,7 @@ Note that most methods listed as `Scorer` also support the `MutationScorer` and 
 | EVcouplings                 | `evedesign.models.evcouplings.EVcouplings`                       | `Scorer`                             |
 | EVE                         | `evedesign.models.eve.EVE`                                       | `Scorer`                             |
 | MixMHC2pred                 | `evedesign.models.immunogenicity.MixMHC2Pred`                    | `Scorer`                             |
+| NetMHCIIpan                 | `evedesign.models.immunogenicity.NetMHCIIpan`                    | `Scorer`                             |
 | promb/OASis humanness       | `evedesign.models.oasis_humanness.OASisHumanness`                | `Scorer`                             |
 | One-hot encoding embedder   | `evedesign.models.embedders.OneHotEmbedder`                      | `Transformer`                        |
 | BLOSUM embedder             | `evedesign.models.embedders.BLOSUMEmbedder`                      | `Transformer`                        |
@@ -127,12 +128,14 @@ Note that most methods listed as `Scorer` also support the `MutationScorer` and 
 
 ### Analyzers
 
-| Name                                   | Class                                                         | Interfaces   | 
-|----------------------------------------|---------------------------------------------------------------|--------------|
-| UMAP sequence space projection         | `evedesign.analyzers.sequence_space.SequenceSpaceUMAP`        | `Analyzer`   |
-| MDS sequence space projection          | `evedesign.analyzers.sequence_space.SequenceSpaceMDS`         | `Analyzer`   |
-| Landmark MDS sequence space projection | `evedesign.analyzers.sequence_space.SequenceSpaceLandmarkMDS` | `Analyzer`   |
-| PCA sequence space projection          | `evedesign.analyzers.sequence_space.SequenceSpacePCA`         | `Analyzer`   |
+| Name                                   | Class                                                                   | Interfaces   | 
+|----------------------------------------|-------------------------------------------------------------------------|--------------|
+| UMAP sequence space projection         | `evedesign.analyzers.sequence_space.SequenceSpaceUMAP`                  | `Analyzer`   |
+| MDS sequence space projection          | `evedesign.analyzers.sequence_space.SequenceSpaceMDS`                   | `Analyzer`   |
+| Landmark MDS sequence space projection | `evedesign.analyzers.sequence_space.SequenceSpaceLandmarkMDS`           | `Analyzer`   |
+| PCA sequence space projection          | `evedesign.analyzers.sequence_space.SequenceSpacePCA`                   | `Analyzer`   |
+| Reference 3D structure comparison      | `evedesign.analyzers.structure_comparison.ReferenceStructureComparison` | `Analyzer`   |
+| Fixed sequence position recovery       | `evedesign.analyzers.position_recovery.FixedPositionRecovery`           | `Analyzer`   |
 
 ### Nucleotide sequence generation
 
