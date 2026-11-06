@@ -6,7 +6,7 @@ from collections.abc import Sequence
 from copy import deepcopy, copy
 from io import StringIO
 from math import isclose
-from typing import NamedTuple, Self, Any, ClassVar
+from typing import NamedTuple, Self, Any, ClassVar, Iterator
 import numpy as np
 
 from evedesign.sequence import valid_sequence, Sequences
@@ -227,7 +227,7 @@ class Interaction:
         Deserialized Interaction object
         """
         return cls(
-            id=interaction_dict.get("id"),
+            id=interaction_dict["id"],
             pos=interaction_dict.get("pos"),
             partner_ids=interaction_dict.get("partner_ids"),
             avoid=interaction_dict.get("avoid"),
@@ -318,12 +318,12 @@ class AtomBond:
         Deserialized AtomBond object
         """
         return cls(
-            type=atom_bond_dict.get("type"),
+            type=atom_bond_dict["type"],
             source_pos=atom_bond_dict.get("source_pos"),
-            source_atom=atom_bond_dict.get("source_atom"),
-            target_entity_id=atom_bond_dict.get("target_entity_id"),
+            source_atom=atom_bond_dict["source_atom"],
+            target_entity_id=atom_bond_dict["target_entity_id"],
             target_pos=atom_bond_dict.get("target_pos"),
-            target_atom=atom_bond_dict.get("target_atom"),
+            target_atom=atom_bond_dict["target_atom"],
         )
 
 class SecondaryStructure:
@@ -385,7 +385,7 @@ class SecondaryStructure:
         """
         return cls(
             pos=secondary_structure_dict.get("pos"),
-            type=secondary_structure_dict.get("type")
+            type=secondary_structure_dict["type"]
         )
 
 
@@ -460,7 +460,7 @@ class ResidueBias:
         """
         return cls(
             pos=residue_bias_dict.get("pos"),
-            bias=residue_bias_dict.get("bias")
+            bias=residue_bias_dict["bias"]
         )
 
 
@@ -521,8 +521,8 @@ class Modification:
         Deserialized Modification object
         """
         return cls(
-            pos=modification_dict.get("pos"),
-            type=modification_dict.get("type"),
+            pos=modification_dict["pos"],
+            type=modification_dict["type"],
         )
 
 
@@ -613,7 +613,7 @@ class Insertion:
         """
         return cls(
             pos=insertion_dict.get("pos"),
-            min_length=insertion_dict.get("min_length"),
+            min_length=insertion_dict["min_length"],
             max_length=insertion_dict.get("max_length"),
             secondary_structure=insertion_dict.get("secondary_structure"),
             interactions=_deserialize_optional_list(
@@ -703,7 +703,7 @@ class Entity:
         # we do not compare structures
         return (
             self._entity_type == other._entity_type and
-            np.array_equal(self.rep, other.rep) and
+            np.array_equal(self.rep, other.rep) and  # type: ignore[arg-type]
             self.id == other.id and
             self.copies == other.copies and
             self.interactions == other.interactions and
@@ -1217,6 +1217,38 @@ class System(UserList[Entity]):
         """
         return deepcopy(self)
 
+    def biopolymers(self) -> Iterator[tuple[int, "BiopolymerEntity"]]:
+        """
+        Helper to return subset of all biopolymer entities in system
+
+        Returns
+        -------
+        Iterator over tuples (entity_index, entity) for all BiopolymerEntity objects
+        in the system
+        """
+        for i, e in enumerate(self.data):
+            if isinstance(e, BiopolymerEntity):
+                yield i, e
+
+    def biopolymer(self, idx: int) -> "BiopolymerEntity":
+        """
+        Helper to retrieve a biopolymer entity from system with
+        narrowed typing
+
+        Parameters
+        ----------
+        idx
+            Entity index in system
+
+        Returns
+        -------
+        Guaranteed biopolymer entity
+        """
+        entity = self.data[idx]
+        if not isinstance(entity, BiopolymerEntity):
+            raise TypeError(f"Entity {idx} is not a biopolymer")
+        return entity
+
     @classmethod
     def from_structure(cls, structure_model: Structure) -> Self:
         """
@@ -1297,9 +1329,9 @@ class System(UserList[Entity]):
                     # (but only if valid sequence)
                     if is_valid_seq and entity_instance.models is not None:
                         # enumerate positions for current sequence
-                        positions = np.arange(
+                        positions = list(range(
                             entity.first_index, entity.first_index + len(entity_instance.rep)
-                        )
+                        ))
 
                         # validate all models attached to current EntityInstance
                         for models in entity_instance.models.values():  # noqa
@@ -1389,7 +1421,7 @@ class System(UserList[Entity]):
 
         # call to alphabet() is valid since we check for BiopolymerEntity above
         entity_to_valid_subs = {
-            entity_idx: self.data[entity_idx].alphabet(include_gap=deletions, include_inserts=insertions)  # noqa
+            entity_idx: self.biopolymer(entity_idx).alphabet(include_gap=deletions, include_inserts=insertions)
             for entity_idx in entity_to_pos
         }
 
@@ -1878,7 +1910,7 @@ class BiopolymerEntity(Entity):
         }
 
     @classmethod
-    def deserialize(cls, entity_dict: dict[str, Any]) -> Self:
+    def deserialize(cls, entity_dict: dict[str, Any]) -> "Entity":
         """
         Deserialize entity from JSON-compatible representation to object instance
 
@@ -1897,7 +1929,7 @@ class BiopolymerEntity(Entity):
             rep=entity_dict.get("rep"),
             id=entity_dict.get("id"),
             copies=entity_dict.get("copies"),
-            first_index=entity_dict.get("first_index"),
+            first_index=entity_dict["first_index"],
             sequences=Sequences.deserialize(sequences) if sequences is not None else None,
             structures=_deserialize_chain_map(entity_dict.get("structures")),
             interactions=_deserialize_optional_list(entity_dict.get("interactions"), Interaction),
@@ -1905,12 +1937,12 @@ class BiopolymerEntity(Entity):
             modifications=_deserialize_optional_list(entity_dict.get("modifications"), Modification),
             symmetry=entity_dict.get("symmetry"),
             secondary_structure=_deserialize_optional_list(entity_dict.get("secondary_structure"), SecondaryStructure),
-            cyclic=entity_dict.get("cyclic"),
+            cyclic=entity_dict.get("cyclic", False),
             min_length=entity_dict.get("min_length"),
             max_length=entity_dict.get("max_length"),
             residue_bias=_deserialize_optional_list(entity_dict.get("residue_bias"), ResidueBias),
             insertions=_deserialize_optional_list(entity_dict.get("insertions"), Insertion),
-            deletions=entity_dict.get("deletions"),
+            deletions=entity_dict.get("deletions", False),
         )
 
     def with_instance(self, entity_instance: "EntityInstance") -> Self:
@@ -2095,7 +2127,7 @@ class Ligand(Entity):
             id=entity_dict.get("id"),
             copies=entity_dict.get("copies"),
             structures=_deserialize_chain_map(entity_dict.get("structures")),
-            ligand_rep_type=entity_dict.get("ligand_rep_type"),
+            ligand_rep_type=entity_dict["ligand_rep_type"],
             interactions=_deserialize_optional_list(entity_dict.get("interactions"), Interaction),
             atom_bonds=_deserialize_optional_list(entity_dict.get("atom_bonds"), AtomBond),
             symmetry=entity_dict.get("symmetry"),

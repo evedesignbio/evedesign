@@ -4,8 +4,8 @@ from typing import Self, Sequence, Any, TypeVar
 import numpy as np
 import pandas as pd
 from evedesign.dataset import LabeledInstanceDataset
-from evedesign.system import System, SystemInstance, Entity, EntityInstance, Mutant, Mutation
-from evedesign.types import StatusCallback, ModelStats, BioPolymers, EntityPosList
+from evedesign.system import System, SystemInstance, Entity, EntityInstance, Mutant, Mutation, BiopolymerEntity
+from evedesign.types import StatusCallback, ModelStats, EntityPosList
 
 
 class _Core(ABC):
@@ -124,13 +124,12 @@ class _Core(ABC):
 
         return [
             (entity_idx, pos)
-            for entity_idx, entity in enumerate(self.system)
+            for entity_idx, entity in self.system.biopolymers()
             for pos, _ in enumerate(
                 source[entity_idx].rep,
                 start=entity.first_index
             )
             if (
-                entity.type in BioPolymers and
                 entity.first_index is not None and
                 source[entity_idx].rep is not None
             )
@@ -452,6 +451,9 @@ class ConditionalMutationScorer(_Core, ABC):
 
         # validate entity / position per instance as we cannot assume fixed length here
         for instance, entity, pos in zip(instances, entities, positions):
+            if not isinstance(self.system[entity], BiopolymerEntity):
+                raise ValueError(f"Entity {entity} is not a biopolymer entity")
+
             self.valid_positions(
                 positions=[pos], instance=instance, entities=[entity], raise_invalid=True
             )
@@ -463,13 +465,15 @@ class ConditionalMutationScorer(_Core, ABC):
         all_refs = []
 
         for instance_idx, (instance, entity, position) in enumerate(zip(instances, entities, positions)):
+            cur_entity = self.system.biopolymer(entity)
+
             # get alphabet for current entity in instance
-            alphabet = self.system[entity].alphabet(
+            alphabet = cur_entity.alphabet(
                 include_inserts=self.handles_insertions, include_gap=self.handles_deletions
             )
 
             # assemble all single mutations for the current triplet (subject to entity type)
-            pos_norm = position - self.system[entity].first_index
+            pos_norm = position - cur_entity.first_index
             cur_ref = str(instance[entity].rep[pos_norm])
             all_refs.append(cur_ref)
 
@@ -493,7 +497,7 @@ class ConditionalMutationScorer(_Core, ABC):
         ])
 
         merged_alphabet = Entity.merge_alphabet_symbols([
-            self.system[entity_idx].alphabet(
+            self.system.biopolymer(entity_idx).alphabet(
                 include_gap=self.handles_deletions,
                 include_inserts=self.handles_insertions,
             ) for entity_idx in set(entities)
@@ -648,7 +652,7 @@ class MutationScorer(_Core, ABC):
         # make sure column index (symbols) has right order
         all_entities = set(series.index.get_level_values("entity"))
         merged_alphabet = Entity.merge_alphabet_symbols([
-            self.system[entity_idx].alphabet(
+            self.system.biopolymer(entity_idx).alphabet(
                 include_gap=self.handles_deletions,
                 include_inserts=self.handles_insertions,
             ) for entity_idx in all_entities
