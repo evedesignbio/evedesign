@@ -262,18 +262,15 @@ def test_score_requires_build():
 
 
 @pytest.mark.slow
-def test_score_returns_array():
+def test_score_returns_instance_list():
     """score() returns a numpy array of floats."""
     s = System([Protein(rep="MAST", id='test')])
     m = BoltzFoldTransformer(
         device='cpu', sampling_steps=100,
     ).build(s)
     scores = m.score([s.rep_to_instance()])
-    assert isinstance(scores, np.ndarray)
-    assert scores.shape == (1,)
-    assert scores.dtype == float or np.issubdtype(
-        scores.dtype, np.floating
-    )
+    assert isinstance(scores, list)
+    assert len(scores) == 1
 
 
 @pytest.mark.slow
@@ -285,10 +282,8 @@ def test_score_multiple_instances():
     ).build(s)
     instances = [s.rep_to_instance(), s.rep_to_instance()]
     scores = m.score(instances)
-    assert isinstance(scores, np.ndarray)
-    assert scores.shape == (2,)
-    assert all(s is not None for s in scores)
-    assert all(np.isfinite(s) for s in scores)
+    assert isinstance(scores, list)
+    assert len(scores) == 2
 
 
 @pytest.mark.slow

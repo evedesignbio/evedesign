@@ -31,8 +31,8 @@ from evedesign.model import (
     ConditionalMutationScorer,
     assign_scores_to_instances,
 )
-from evedesign.system import System, SystemInstance, Entity
-from evedesign.constants import GAP, MASK
+from evedesign.system import System, SystemInstance, Entity, Protein
+from evedesign.constants import GAP
 from evedesign.types import StatusCallback
 from evedesign.utils import status_done, status_start
 
@@ -137,10 +137,9 @@ class EVcouplings(BaseModel, Scorer, MutationScorer, ConditionalMutationScorer):
 
         # will eventually include evcomplex, would have been kind of a lot of work
         # and not sure if evedesign can handle paired MSA+instances without modification
-        if len(system) != 1 or system[0].type != "protein":
+        if len(system) != 1 or not isinstance(target := system[0], Protein):
             return False, "Can only handle a single-component protein system"
 
-        target = system[0]
         if not target.defined_sequence():
             return False, "Entity must have a defined rep sequence"
 
@@ -234,7 +233,7 @@ class EVcouplings(BaseModel, Scorer, MutationScorer, ConditionalMutationScorer):
         status_start(status_callback, "Fitting EVcouplings model")
 
         self._system = system
-        target = system[0]
+        target = system.biopolymer(0)
 
         # reset any previous fit
         self.model = None
@@ -277,7 +276,7 @@ class EVcouplings(BaseModel, Scorer, MutationScorer, ConditionalMutationScorer):
         content are not part of the fitted model and are therefore not returned
         """
         self.ready_or_raise()
-        first_index = self.system[0].first_index
+        first_index = self.system.biopolymer(0).first_index
         return [(0, int(pos) - 1 + first_index) for pos in self._index_list]
 
 
@@ -383,7 +382,7 @@ class EVcouplings(BaseModel, Scorer, MutationScorer, ConditionalMutationScorer):
         status_start(status_callback, "Computing single mutation scan")
 
         model = self.model
-        first_index = self.system[0].first_index
+        first_index = self.system.biopolymer(0).first_index
 
         # map the instance onto the integer background over modelled positions
         bg, subseq, invalid = self._instance_background(instance)
@@ -415,9 +414,10 @@ class EVcouplings(BaseModel, Scorer, MutationScorer, ConditionalMutationScorer):
             ),
         )
 
+        target = self.system.biopolymer(0)
         # reorder/select columns into the evedesign alphabet
         merged_alphabet = Entity.merge_alphabet_symbols([
-            self.system[0].alphabet(
+            target.alphabet(
                 include_gap=self.handles_deletions,
                 include_inserts=self.handles_insertions,
             )
@@ -460,7 +460,7 @@ class EVcouplings(BaseModel, Scorer, MutationScorer, ConditionalMutationScorer):
         status_start(status_callback, "Computing conditional scores")
 
         model = self.model
-        first_index = self.system[0].first_index
+        first_index = self.system.biopolymer(0).first_index
         num_symbols = model.num_symbols
 
         # evedesign position -> model array index
@@ -497,7 +497,7 @@ class EVcouplings(BaseModel, Scorer, MutationScorer, ConditionalMutationScorer):
         )
 
         merged_alphabet = Entity.merge_alphabet_symbols([
-            self.system[entity_idx].alphabet(
+            self.system.biopolymer(entity_idx).alphabet(
                 include_gap=self.handles_deletions,
                 include_inserts=self.handles_insertions,
             ) for entity_idx in set(entities)

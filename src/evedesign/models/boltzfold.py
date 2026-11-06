@@ -43,7 +43,7 @@ DEFAULT_CACHE_DIR = os.path.expanduser("~/.cache/boltz")
 
 import tempfile
 
-from evedesign.model import BaseModel, Transformer, Scorer
+from evedesign.model import BaseModel, Transformer, Scorer, assign_scores_to_instances
 from evedesign.utils import model_param_context
 from evedesign.system import System, SystemInstance
 from evedesign.types import DeviceType, StatusCallback, BatchSize
@@ -417,7 +417,7 @@ class BoltzFoldTransformer(BaseModel, Transformer, Scorer):
         self,
         instances: Sequence[SystemInstance],
         status_callback: StatusCallback | None = None,
-    ) -> np.ndarray[tuple[int], np.dtype[float]]:  # type: ignore
+    ) -> list[SystemInstance]:
         """
         Run Boltz-2 prediction for each instance and
         return an array of confidence scores.
@@ -431,7 +431,7 @@ class BoltzFoldTransformer(BaseModel, Transformer, Scorer):
             instances,
             status_callback=status_callback,
         )
-        return np.array(
-            [inst.score for inst in transformed]
-        )
 
+        return assign_scores_to_instances(
+            instances, [inst.score for inst in transformed]
+        )

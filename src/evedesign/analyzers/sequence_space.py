@@ -321,7 +321,7 @@ class SequenceSpaceProjection(Analyzer, ABC):
                     "this feature may be implemented at a later time"
                 )
 
-            system_sequences = system.data[entities[0]].sequences
+            system_sequences = system.biopolymer(entities[0]).sequences
             if system_sequences is not None and require_aligned and not system_sequences.aligned:
                 raise ValueError(
                     "System sequences must be aligned for analysis"
@@ -331,7 +331,7 @@ class SequenceSpaceProjection(Analyzer, ABC):
         # like alphabets when performing actual computation
         all_seqs = []
         for entity in entities:
-            cur_entity_seqs = system.data[entity].sequences
+            cur_entity_seqs = system.biopolymer(entity).sequences
             if self.include_system_sequences and cur_entity_seqs is not None:
                 # if requiring alignment, remove dealigned positions (otherwise will rarely find an MSA
                 # that could be handled)
@@ -445,7 +445,7 @@ class SequenceSpaceProjection(Analyzer, ABC):
             assert len(system_projections) == len(system_seq_indices)
 
             for (seq_idx, proj) in zip(system_seq_indices, system_projections):
-                seq = updated_system[entities[0]].sequences.seqs[seq_idx]
+                seq = updated_system.biopolymer(entities[0]).sequences.seqs[seq_idx]
                 if seq.metadata is None:
                     seq.metadata = {}
 
@@ -592,7 +592,7 @@ class SequenceSpaceProjectionAligned(SequenceSpaceProjection):
             map_array(
                 str_to_np_char_view(seqs),
                 # do not map gaps so we can easily exclude with same value in numba calculation
-                index_map(system[entity].alphabet(include_gap=False), default_value=default_value),
+                index_map(system.biopolymer(entity).alphabet(include_gap=False), default_value=default_value),
             )
             for (entity, seqs, _) in collected_sequences
         ]
@@ -981,7 +981,7 @@ class SequenceSpaceLandmarkMDS(SequenceSpaceProjection):
                 map_array(
                     str_to_np_char_view(seqs),
                     # do not map gaps so we can easily exclude with same value in numba calculation
-                    index_map(system[entity].alphabet(include_gap=False), default_value=default_value),
+                    index_map(system.biopolymer(entity).alphabet(include_gap=False), default_value=default_value),
                 )
                 for (entity, seqs, _) in collected_sequences
             ]

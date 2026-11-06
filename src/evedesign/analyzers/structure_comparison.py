@@ -22,10 +22,9 @@ from loguru import logger
 from evedesign.analysis import Analyzer
 from evedesign.constants import GAP
 from evedesign.structure import Structure
-from evedesign.system import System, SystemInstance, Entity, EntityInstance
+from evedesign.system import System, SystemInstance, BiopolymerEntity, EntityInstance
 from evedesign.tools.structure_mapping import map_structure_chain_to_entity_pairwise
 from evedesign.types import StructureComparison, STRUCTURE_COMPARISON_COMPONENT_KEY
-from evedesign.utils import ensure_sequence
 
 # (entity index, copy index, residue number in entity numbering)
 ResidueKey = tuple[int, int, int]
@@ -44,6 +43,19 @@ MIN_REFERENCE_IDENTITY = 0.5
 BACKBONE_ATOMS = {"N", "CA", "C", "O", "P", "C1'", "C2'", "C3'", "C4'", "C5'", "O3'", "O4'", "O5'"}
 
 
+def _chain_list(chains: Structure | Sequence[Structure]) -> list[Structure]:
+    return [chains] if isinstance(chains, Structure) else list(chains)
+
+
+def entity_sequence(entity: BiopolymerEntity) -> dict[int, str]:
+    """
+    Rep of biopolymer entity as {position: symbol}; raises if rep is not defined
+    """
+    if (rep := entity.rep) is None:
+        raise ValueError(f"Entity {entity.id} has no defined rep")
+    return dict(zip(entity.positions(), map(str, rep)))
+
+
 class StructureComparisonData(TypedDict, total=False):
     """
     data argument of ReferenceStructureComparison.analyze()
@@ -55,7 +67,7 @@ class StructureComparisonData(TypedDict, total=False):
 def _atom_table(chains: Chains, atom_names: Sequence[str]) -> _AtomTable:
     table = {}
     for entity_idx, copies in chains.items():
-        for copy_idx, chain in enumerate(ensure_sequence(copies)):
+        for copy_idx, chain in enumerate(_chain_list(copies)):
             arr = chain.atom_array
             # polymer residues only (keeps e.g. MSE, excludes ions such as calcium named "CA")
             sel = np.isin(arr.atom_name, atom_names) & (
@@ -97,13 +109,13 @@ def _copy_assignments(reference: Chains, model: Chains, match_copies: bool) -> l
     """
     per_entity = []
     for entity_idx in reference:
-        n_ref, n_model = len(ensure_sequence(reference[entity_idx])), len(ensure_sequence(model[entity_idx]))
+        n_ref, n_model = len(_chain_list(reference[entity_idx])), len(_chain_list(model[entity_idx]))
         if n_ref > n_model:
             raise ValueError(f"Entity {entity_idx}: reference has {n_ref} copies but model only {n_model}")
         if match_copies and n_model > MAX_COPIES_FOR_PERMUTATION:
             logger.warning(f"Entity {entity_idx}: {n_model} copies, skipping copy permutation search")
         if match_copies and n_model <= MAX_COPIES_FOR_PERMUTATION:
-            options = permutations(range(n_model), n_ref)
+            options = list(permutations(range(n_model), n_ref))
         else:
             options = [tuple(range(n_ref))]
         per_entity.append([(entity_idx, opt) for opt in options])
@@ -164,7 +176,7 @@ def compare_structures(
         raise ValueError(f"Model lacks entities present in reference: {sorted(missing)}")
     if subsets and FULL_SUBSET in subsets:
         raise ValueError(f"Subset name '{FULL_SUBSET}' is reserved for the full comparison")
-    ref_copies = {(e, c) for e, copies in reference.items() for c in range(len(ensure_sequence(copies)))}
+    ref_copies = {(e, c) for e, copies in reference.items() for c in range(len(_chain_list(copies)))}
     for name, residues in (subsets or {}).items():
         if invalid := {(int(e), int(c)) for e, c, _ in residues} - ref_copies:
             raise ValueError(f"Subset {name} refers to (entity, copy) not in reference: {sorted(invalid)}")
@@ -198,7 +210,7 @@ def compare_structures(
     results = [record(FULL_SUBSET, FULL_SUBSET, num_atoms, full_rmsd, tm, full_transform)]
     for name, residues in (subsets or {}).items():
         ref_xyz, model_xyz = _paired_coords(
-            ref_table, model_table, assignment, {tuple(int(x) for x in r) for r in residues}
+            ref_table, model_table, assignment, {(int(r[0]), int(r[1]), int(r[2])) for r in residues}
         )
         if len(ref_xyz) < 3:
             logger.warning(f"Subset {name}: only {len(ref_xyz)} shared atoms, skipping")
@@ -213,40 +225,48 @@ def compare_structures(
     return results
 
 
-def instance_to_entity_positions(entity: Entity, entity_instance: EntityInstance) -> dict[int, int]:
+def instance_to_entity_positions(entity: BiopolymerEntity, entity_instance: EntityInstance) -> dict[int, int]:
     """
     Map entity instance positions to entity positions. Following the A3M-style EntityInstance coding,
     uppercase symbols and gaps consume one entity position; lowercase symbols (insertions) and gaps
     (no residue) are not part of the mapping.
     """
-    mapping, entity_pos = {}, entity.first_index
-    for inst_pos, symbol in enumerate(map(str, entity_instance.rep), start=entity.first_index):
+    entity_rep, instance_rep = entity.rep, entity_instance.rep
+    if entity_rep is None or instance_rep is None:
+        raise ValueError("Entity and entity instance rep must be defined")
+
+    first_index = entity.first_index
+    mapping: dict[int, int] = {}
+    entity_pos = first_index
+    for inst_pos, symbol in enumerate(map(str, instance_rep), start=first_index):
         if symbol.isupper():
             mapping[inst_pos] = entity_pos
         if symbol.isupper() or symbol == GAP:
             entity_pos += 1
 
-    if entity_pos - entity.first_index != len(entity.rep):
+    if entity_pos - first_index != len(entity_rep):
         raise ValueError(
-            f"Instance rep covers {entity_pos - entity.first_index} entity positions, entity has {len(entity.rep)}"
+            f"Instance rep covers {entity_pos - first_index} entity positions, entity has {len(entity_rep)}"
         )
     return mapping
 
 
 def models_to_entity_numbering(
-    entity: Entity, entity_instance: EntityInstance, chains: Structure | Sequence[Structure]
+    entity: BiopolymerEntity, entity_instance: EntityInstance, chains: Structure | Sequence[Structure]
 ) -> list[Structure]:
     """
     Validate model chains against the entity instance (numbering and sequence) and renumber
     them into entity numbering, dropping inserted residues
     """
-    if entity_instance.rep is None:
+    instance_rep = entity_instance.rep
+    if instance_rep is None:
         raise ValueError("Entity instance rep must be defined to compare its models")
-    positions = range(entity.first_index, entity.first_index + len(entity_instance.rep))
+    positions = list(range(entity.first_index, entity.first_index + len(instance_rep)))
+    sequence = [str(symbol) for symbol in instance_rep]  # represents() expects Sequence[str]
     mapping = instance_to_entity_positions(entity, entity_instance)
     renumbered = []
-    for copy_idx, chain in enumerate(ensure_sequence(chains)):
-        if not chain.represents(list(positions), entity_instance.rep, allow_missing=True):
+    for copy_idx, chain in enumerate(_chain_list(chains)):
+        if not chain.represents(positions, sequence, allow_missing=True):
             raise ValueError(
                 f"Model copy {copy_idx} does not match numbering/sequence of the entity instance "
                 f"(expected numbering from first_index along the instance rep)"
@@ -255,7 +275,7 @@ def models_to_entity_numbering(
     return renumbered
 
 
-def _map_to_entity(entity: Entity, chain: Structure, **kwargs) -> Structure:
+def _map_to_entity(entity: BiopolymerEntity, chain: Structure, **kwargs) -> Structure:
     """
     Renumber reference chain into entity numbering by sequence alignment, keeping polymer residues only;
     kwargs are passed to map_structure_chain_to_entity_pairwise (e.g. gap_penalty, local)
@@ -305,7 +325,7 @@ class ReferenceStructureComparison(Analyzer):
         self.reference_id = reference_id
         self.model_ids = model_ids
         self.atom_names = list(atom_names)
-        self.subset_superposition = subset_superposition
+        self.subset_superposition: Literal["self", "global"] = subset_superposition
         self.match_copies = match_copies
         self.map_reference = map_reference
         self.map_reference_kwargs = dict(map_reference_kwargs or {})
@@ -315,28 +335,26 @@ class ReferenceStructureComparison(Analyzer):
 
     def _reference(self, system: System, reference: Chains | None, entity: int | None) -> dict[int, list[Structure]]:
         from_data = reference is not None
-        if not from_data:
+        if reference is None:
             reference = {
                 idx: e.structures[self.reference_id] for idx, e in enumerate(system)
                 if e.structures is not None and self.reference_id in e.structures
             }
-        chains = {
-            idx: list(ensure_sequence(c)) for idx, c in reference.items() if entity is None or idx == entity
+        chains: dict[int, list[Structure]] = {
+            idx: _chain_list(c) for idx, c in reference.items() if entity is None or idx == entity
         }
         if not chains:
             source = "passed via data" if from_data else f"'{self.reference_id}' attached to system"
             raise ValueError(f"No reference structure ({source}) for any selected entity")
 
-        for idx, copies in chains.items():
+        for idx in chains:
             if not 0 <= idx < len(system):
                 raise ValueError(f"Reference given for entity {idx} not in system")
+            polymer = system.biopolymer(idx)
+            entity_seq = entity_sequence(polymer)
             if self.map_reference and from_data:
-                chains[idx] = copies = [
-                    _map_to_entity(system[idx], chain, **self.map_reference_kwargs) for chain in copies
-                ]
-            # positions() is empty for entities without rep, so zip yields nothing then
-            entity_seq = dict(zip(system[idx].positions(), map(str, system[idx].rep if system[idx].rep is not None else ())))
-            for copy_idx, chain in enumerate(copies):
+                chains[idx] = [_map_to_entity(polymer, chain, **self.map_reference_kwargs) for chain in chains[idx]]
+            for copy_idx, chain in enumerate(chains[idx]):
                 if not chain.represents(list(entity_seq), allow_missing=True):
                     raise ValueError(
                         f"Reference for entity {idx}, copy {copy_idx} is not a single chain numbered "
@@ -379,11 +397,21 @@ class ReferenceStructureComparison(Analyzer):
         -------
         Unchanged system and shallow copies of instances with updated metadata
         """
-        data = data or {}
+        if data is None:
+            data = StructureComparisonData()
         if unknown := set(data) - {"reference", "subsets"}:
             raise ValueError(f"Unknown keys in data: {sorted(unknown)}; allowed are 'reference', 'subsets'")
 
         reference = self._reference(system, data.get("reference"), entity)
+        polymers = {idx: system.biopolymer(idx) for idx in reference}
+
+        # subset positions outside the compared entities would silently shrink the subset
+        entity_positions = {idx: set(polymer.positions()) for idx, polymer in polymers.items()}
+        for name, residues in (data.get("subsets") or {}).items():
+            if invalid := sorted(
+                {(int(e), int(p)) for e, _, p in residues if int(p) not in entity_positions.get(int(e), set())}
+            ):
+                raise ValueError(f"Subset {name} contains positions outside the compared entities: {invalid}")
 
         updated = []
         for inst in instances:
@@ -394,13 +422,14 @@ class ReferenceStructureComparison(Analyzer):
                 if r.get("reference") != self.reference_id
             ]
 
-            available = set.intersection(*[set(inst[idx].models or {}) for idx in reference])
+            entity_models = {idx: inst[idx].models or {} for idx in reference}
+            available = set.intersection(*[set(models) for models in entity_models.values()])
             for model_id in sorted(available) if self.model_ids is None else self.model_ids:
                 if model_id not in available:
                     logger.warning(f"Instance {inst.id}: model '{model_id}' missing, skipping")
                     continue
                 model = {
-                    idx: models_to_entity_numbering(system[idx], inst[idx], inst[idx].models[model_id])
+                    idx: models_to_entity_numbering(polymers[idx], inst[idx], entity_models[idx][model_id])
                     for idx in reference
                 }
                 for r in compare_structures(
@@ -420,13 +449,17 @@ def superposed_model(instance: SystemInstance, record: StructureComparison) -> S
     Superposed predicted model (all atoms, all entities and copies) for a comparison record,
     e.g. to write to file for visual inspection
     """
+    model_id = record.get("model")
+    if model_id is None:
+        raise ValueError("Record has no model id (only records produced by ReferenceStructureComparison have one)")
     matrix = np.array(record["transform"])
     chains = [
         chain
         for entity_instance in instance
-        if entity_instance.models is not None and record["model"] in entity_instance.models
-        for chain in ensure_sequence(entity_instance.models[record["model"]])
+        if entity_instance.models is not None and model_id in entity_instance.models
+        for chain in _chain_list(entity_instance.models[model_id])
     ]
-    merged = Structure.concat(chains).atom_array.copy()
+    # concat() creates a new AtomArray, so the instance's models are not modified
+    merged = Structure.concat(chains).atom_array
     merged.coord = merged.coord @ matrix[:3, :3].T + matrix[:3, 3]
     return Structure(merged)

@@ -1,7 +1,7 @@
 from contextlib import contextmanager
 from collections import defaultdict
 import os
-from typing import Callable, Sequence, TypeVar, Mapping
+from typing import Callable, Sequence, TypeVar, Mapping, Any
 import numpy as np
 from evedesign.types import StatusCallback
 
@@ -96,7 +96,7 @@ def map_array(x: np.ndarray, map_: Mapping) -> np.ndarray:
         map_.__getitem__
     )(x)
 
-def index_map(options: list[any], default_option: any = None, default_value: int | None = None):
+def index_map(options: list[Any], default_option: Any = None, default_value: int | None = None):
     """
     Create mapping from a list of options to integer indices (typically used with map_array above)
 

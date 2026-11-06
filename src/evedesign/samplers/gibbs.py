@@ -10,7 +10,7 @@ from scipy.special import softmax
 from loguru import logger
 from evedesign.constants import GAP
 from evedesign.model import Generator, ConditionalMutationScorer, Scorer
-from evedesign.system import System, Entity, SystemInstance, EntityInstance
+from evedesign.system import System, Entity, SystemInstance, EntityInstance, BiopolymerEntity
 from evedesign.types import StatusCallback, CHAIN_COMPONENT_KEY, SCORE_COMPONENT_KEY, EntityPosList
 from evedesign.utils import status_progress, ensure_sequence, map_array
 
@@ -152,7 +152,7 @@ class GibbsSampler(Generator):
                 )
 
             for entity_idx, entity in enumerate(scorers[0].system):
-                if bool(entity.deletions) and not scorer.handles_deletions:
+                if isinstance(entity, BiopolymerEntity) and bool(entity.deletions) and not scorer.handles_deletions:
                     raise ValueError(
                         f"Scorer {i} does not handle deletions but entity {entity_idx} has deletions = True"
                     )
@@ -297,8 +297,8 @@ class GibbsSampler(Generator):
 
         # set up joint alphabet, merging across all entity types that are designed
         alphabet = Entity.merge_alphabet_symbols([
-            self._system[entity_idx].alphabet(
-                include_gap=bool(self._system[entity_idx].deletions)
+            self._system.biopolymer(entity_idx).alphabet(
+                include_gap=bool(self._system.biopolymer(entity_idx).deletions)
             ) for entity_idx in entities
         ])
 
@@ -350,9 +350,9 @@ class GibbsSampler(Generator):
         )
 
         for array_idx, entity_idx in enumerate(entities):
-            entity = self._system[entity_idx]
+            entity = self._system.biopolymer(entity_idx)
             alphabet = entity.alphabet(
-                include_gap=bool(self._system[entity_idx].deletions)
+                include_gap=bool(self._system.biopolymer(entity_idx).deletions)
             )
             alphabet_set = set(alphabet)
 
@@ -434,7 +434,7 @@ class GibbsSampler(Generator):
         for entity_idx, entity in enumerate(self.system):
             try:
                 # if we want deletions, make sure the score column is present
-                if bool(entity.deletions):
+                if isinstance(entity, BiopolymerEntity) and bool(entity.deletions):
                     entity_rows = scores.loc[pd.IndexSlice[:, entity_idx, :]]
                     if GAP not in entity_rows.columns:
                         raise ValueError(
@@ -524,7 +524,7 @@ class GibbsSampler(Generator):
 
         # check if we can use system rep to normalize the scores to a shared reference
         try:
-            ref_instance = self.system.rep_to_instance()
+            ref_instance = self.system.rep_to_instance(require_reps=True)
             instances_with_ref = [ref_instance] + instances
         except ValueError:
             ref_instance = None

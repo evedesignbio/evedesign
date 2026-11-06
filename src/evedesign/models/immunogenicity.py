@@ -313,9 +313,7 @@ class MHCIIPresentationPredictor(
 
         assert self._system is not None  # guaranteed by ready_or_raise above
         first_indices: list[int] = []
-        for idx, system_entity in enumerate(self._system):
-            if system_entity.first_index is None:
-                raise ValueError(f"Entity {idx} has no first_index set")
+        for idx, system_entity in self._system.biopolymers():
             first_indices.append(system_entity.first_index)
 
         status_start(status_callback, "Starting scoring")

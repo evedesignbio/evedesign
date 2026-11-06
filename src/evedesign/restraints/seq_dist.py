@@ -92,7 +92,7 @@ class LinearSeqDistRestraint(BaseModel, Scorer, MutationScorer, ConditionalMutat
 
         # determine valid sequence entities that could be restrained
         valid_entities_to_len = {
-            entity_idx: len(entity.rep) for entity_idx, entity in enumerate(system) if entity.defined_sequence()
+            entity_idx: len(entity.rep) for entity_idx, entity in system.biopolymers() if entity.defined_sequence()
         }
 
         if len(data) == 0:
@@ -135,7 +135,7 @@ class LinearSeqDistRestraint(BaseModel, Scorer, MutationScorer, ConditionalMutat
         # store alphabets for each entity
         self._alphabets = {
             entity_idx: entity.alphabet(include_gap=True)
-            for entity_idx, entity in enumerate(self._system)
+            for entity_idx, entity in self._system.biopolymers()
             if entity.defined_sequence()
         }
 

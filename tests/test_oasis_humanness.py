@@ -5,7 +5,6 @@ import pytest
 from evedesign.models import oasis_humanness
 from evedesign.models.oasis_humanness import OASisHumanness
 from evedesign.system import (
-    Entity,
     EntityInstance,
     Mutation,
     Protein,

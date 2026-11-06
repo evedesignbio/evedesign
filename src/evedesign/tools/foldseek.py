@@ -931,7 +931,7 @@ def add_structures_foldseek(
 
             # remap structure to target sequence numbering
             s_mapped = remap_structure_from_hit(
-                hit, s, first_index=system[entity_idx].first_index
+                hit, s, first_index=system.biopolymer(entity_idx).first_index
             )
 
             # attach chain(s) to system

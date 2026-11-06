@@ -11,7 +11,7 @@ import pandas as pd
 from evedesign.model import (
     BaseModel, Scorer, Generator, MutationScorer, ConditionalMutationScorer, Transformer, assign_scores_to_instances
 )
-from evedesign.system import System, SystemInstance, EntityInstance, Mutant
+from evedesign.system import System, SystemInstance, EntityInstance, Mutant, Protein
 from evedesign.constants import MASK
 from evedesign.utils import ensure_sequence, model_param_context
 from evedesign.types import DeviceType, StatusCallback, BatchSize, EntityPosList
@@ -165,10 +165,10 @@ class EVmutation2(BaseModel, Scorer, MutationScorer, ConditionalMutationScorer, 
         if data is not None:
             return False, "Model does not support data parameter (must be None)"
 
-        if len(system) != 1 or system[0].type != "protein":
+        if len(system) != 1 or not isinstance(system[0], Protein):
             return False, "Can only handle single-component protein system"
 
-        target = system[0]
+        target = system.biopolymer(0)
         if not target.defined_sequence():
             return False, "Entity must have defined rep sequence"
 
@@ -222,7 +222,7 @@ class EVmutation2(BaseModel, Scorer, MutationScorer, ConditionalMutationScorer, 
 
         # store system with this instance
         self._system = system
-        target = self.system[0]
+        target = self.system.biopolymer(0)
 
         # load MSA
         # TODO: clunky hack - reassemble sequences back into one string and pass into parser;
@@ -354,7 +354,7 @@ class EVmutation2(BaseModel, Scorer, MutationScorer, ConditionalMutationScorer, 
             # not used for now
             entities = [0]  # noqa
 
-        target = self.system[0]
+        target = self.system.biopolymer(0)
 
         # extract fixed pos for single chain
         if fixed_pos is not None:
@@ -562,7 +562,7 @@ class EVmutation2(BaseModel, Scorer, MutationScorer, ConditionalMutationScorer, 
 
         # extract single target entity from system, nd get sequence from instance
         # (we safely can access this as we have verified instance against system)
-        target = self.system[0]
+        target = self.system.biopolymer(0)
         instance_seq = instance[0].rep
 
         # validate positions
@@ -640,7 +640,7 @@ class EVmutation2(BaseModel, Scorer, MutationScorer, ConditionalMutationScorer, 
 
         # extract single target entity from system, and get sequence from instance
         # (we safely can access this as we have verified instance against system)
-        target = self.system[0]
+        target = self.system.biopolymer(0)
         instance_seq = instance[0].rep
 
         # transform mutants into format expected by EVmutation2
@@ -718,7 +718,7 @@ class EVmutation2(BaseModel, Scorer, MutationScorer, ConditionalMutationScorer, 
         if not len(instances) == len(entities) == len(positions):
             raise ValueError("Sequences for instances, entities and positions must all have same length")
 
-        target = self.system[0]
+        target = self.system.biopolymer(0)
 
         # validate positions
         self.valid_positions(positions, entities=0, raise_invalid=True)

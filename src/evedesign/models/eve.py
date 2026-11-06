@@ -231,7 +231,7 @@ class EVE(BaseModel, Generator, Scorer, Transformer, MutationScorer):
         Return the target positions retained as EVE focus columns.
         """
         self.ready_or_raise()
-        first_index = self.system[0].first_index
+        first_index = self.system.biopolymer(0).first_index
         return [(0, first_index + col) for col in self._focus_cols]
 
     @classmethod
@@ -242,7 +242,7 @@ class EVE(BaseModel, Generator, Scorer, Transformer, MutationScorer):
         if len(system) != 1 or system[0].type != "protein":
             return False, "Can only handle single-component protein system"
 
-        target = system[0]
+        target = system.biopolymer(0)
         if not target.defined_sequence():
             return False, "Entity must have defined rep sequence"
 
@@ -377,7 +377,7 @@ class EVE(BaseModel, Generator, Scorer, Transformer, MutationScorer):
 
         # store system with this instance
         self._system = system
-        target = self.system[0]
+        target = self.system.biopolymer(0)
 
         self.model_name = (target.id if target.id is not None else "protein") + "_EVE"
 

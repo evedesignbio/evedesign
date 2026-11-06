@@ -31,7 +31,7 @@ from evedesign.system import (
     Entity,
     EntityInstance,
     System,
-    SystemInstance,
+    SystemInstance, BiopolymerEntity,
 )
 from evedesign.types import EntityPosList
 
@@ -899,7 +899,7 @@ def _parse_single_design(
         # Designs are variable length here, so the mapping comes from the
         # chain's own res_ids rather than len(rep): remap silently drops
         # any residue the mapping does not cover.
-        if entity.first_index is not None:
+        if isinstance(entity, BiopolymerEntity):
             chains = [
                 chain.remap({
                     int(res_id): pos

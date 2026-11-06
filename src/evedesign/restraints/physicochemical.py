@@ -14,7 +14,7 @@ from evedesign.model import (
     assign_scores_to_instances,
 )
 from evedesign.system import System, SystemInstance
-from evedesign.types import StatusCallback, Site
+from evedesign.types import StatusCallback
 from evedesign.utils import status_start, status_done
 
 
