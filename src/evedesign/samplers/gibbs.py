@@ -10,7 +10,7 @@ from scipy.special import softmax
 from loguru import logger
 from evedesign.constants import GAP
 from evedesign.model import Generator, ConditionalMutationScorer, Scorer
-from evedesign.system import System, Entity, SystemInstance, EntityInstance
+from evedesign.system import System, Entity, SystemInstance, EntityInstance, BiopolymerEntity
 from evedesign.types import StatusCallback, CHAIN_COMPONENT_KEY, SCORE_COMPONENT_KEY, EntityPosList
 from evedesign.utils import status_progress, ensure_sequence, map_array
 
@@ -152,7 +152,7 @@ class GibbsSampler(Generator):
                 )
 
             for entity_idx, entity in enumerate(scorers[0].system):
-                if bool(entity.deletions) and not scorer.handles_deletions:
+                if isinstance(entity, BiopolymerEntity) and bool(entity.deletions) and not scorer.handles_deletions:
                     raise ValueError(
                         f"Scorer {i} does not handle deletions but entity {entity_idx} has deletions = True"
                     )
@@ -434,7 +434,7 @@ class GibbsSampler(Generator):
         for entity_idx, entity in enumerate(self.system):
             try:
                 # if we want deletions, make sure the score column is present
-                if bool(entity.deletions):
+                if isinstance(entity, BiopolymerEntity) and bool(entity.deletions):
                     entity_rows = scores.loc[pd.IndexSlice[:, entity_idx, :]]
                     if GAP not in entity_rows.columns:
                         raise ValueError(
