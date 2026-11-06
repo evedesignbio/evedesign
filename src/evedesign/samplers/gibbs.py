@@ -297,8 +297,8 @@ class GibbsSampler(Generator):
 
         # set up joint alphabet, merging across all entity types that are designed
         alphabet = Entity.merge_alphabet_symbols([
-            self._system[entity_idx].alphabet(
-                include_gap=bool(self._system[entity_idx].deletions)
+            self._system.biopolymer(entity_idx).alphabet(
+                include_gap=bool(self._system.biopolymer(entity_idx).deletions)
             ) for entity_idx in entities
         ])
 
@@ -350,9 +350,9 @@ class GibbsSampler(Generator):
         )
 
         for array_idx, entity_idx in enumerate(entities):
-            entity = self._system[entity_idx]
+            entity = self._system.biopolymer(entity_idx)
             alphabet = entity.alphabet(
-                include_gap=bool(self._system[entity_idx].deletions)
+                include_gap=bool(self._system.biopolymer(entity_idx).deletions)
             )
             alphabet_set = set(alphabet)
 

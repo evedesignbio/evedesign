@@ -5,7 +5,7 @@ from Bio.Align import substitution_matrices
 
 from evedesign.constants import GAP, VALID_AA_SORTED
 from evedesign.model import BaseModel, Transformer
-from evedesign.system import Entity, System, SystemInstance
+from evedesign.system import System, SystemInstance, BiopolymerEntity
 from evedesign.types import StatusCallback
 
 
@@ -87,7 +87,7 @@ class OneHotEmbedder(BaseModel, Transformer):
     def system(self) -> System | None:
         return self._system
 
-    def _entity_alphabet(self, entity: Entity) -> list[str]:
+    def _entity_alphabet(self, entity: BiopolymerEntity) -> list[str]:
         """
         Alphabet for a single biopolymer entity: canonicals + gap, plus dedicated
         insertion states when independent_insertion_alphabet is True.
@@ -105,7 +105,7 @@ class OneHotEmbedder(BaseModel, Transformer):
         if len(system) == 0:
             return False, "System must contain at least one entity"
 
-        if not all(entity.is_biopolymer() for entity in system):
+        if not all(isinstance(entity, BiopolymerEntity) for entity in system):
             return False, "All entities in the system must be biopolymers to encode"
 
         return True, ""
@@ -125,7 +125,7 @@ class OneHotEmbedder(BaseModel, Transformer):
             self._entity_to_alphabet = {
                 entity_idx: self._entity_alphabet(entity)
                 for entity_idx, entity in enumerate(system)
-                if entity.is_biopolymer()
+                if isinstance(entity, BiopolymerEntity)
             }
             self._symbol_to_index = {
                 entity_idx: {symbol: col for col, symbol in enumerate(alphabet)}
@@ -140,9 +140,9 @@ class OneHotEmbedder(BaseModel, Transformer):
         type present. Every entity is mapped to the master alphabet.
         """
         # one representative entity per unique type, preserving canonical order
-        type_to_entity: dict[str, Entity] = {}
+        type_to_entity: dict[str, BiopolymerEntity] = {}
         for entity in system:
-            if entity.is_biopolymer() and entity.type not in type_to_entity:
+            if isinstance(entity, BiopolymerEntity) and entity.type not in type_to_entity:
                 type_to_entity[entity.type] = entity
         ordered_types = [t for t in self._CANONICAL_TYPE_ORDER if t in type_to_entity]
 

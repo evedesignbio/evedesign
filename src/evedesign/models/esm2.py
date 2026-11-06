@@ -8,7 +8,7 @@ from loguru import logger
 from evedesign.model import (
     BaseModel, Scorer, MutationScorer, ConditionalMutationScorer, Transformer, assign_scores_to_instances
 )
-from evedesign.system import System, SystemInstance, Mutant
+from evedesign.system import System, SystemInstance, Mutant, Protein
 from evedesign.utils import model_param_context
 from evedesign.types import DeviceType, StatusCallback, BatchSize
 
@@ -102,7 +102,7 @@ class ESM2(BaseModel, Scorer, MutationScorer, ConditionalMutationScorer, Transfo
         if data is not None:
             return False, "Model does not support data parameter (must be None)"
 
-        if len(system) != 1 or system[0].type != "protein":
+        if len(system) != 1 or not isinstance(system[0], Protein):
             return False, "Can only handle single-component protein system"
 
         target = system[0]
@@ -302,7 +302,7 @@ class ESM2(BaseModel, Scorer, MutationScorer, ConditionalMutationScorer, Transfo
             raise ValueError("Model can only handle one single entity")
 
         # Get sequence and convert to string if needed
-        target = self.system[0]
+        target = self.system.biopolymer(0)
         instance_seq = instance[0].rep
         instance_seq = "".join(instance_seq)
 
@@ -404,7 +404,7 @@ class ESM2(BaseModel, Scorer, MutationScorer, ConditionalMutationScorer, Transfo
         )
 
         # Get instance sequence
-        target = self.system[0]
+        target = self.system.biopolymer(0)
         instance_seq = instance[0].rep
         instance_seq = "".join(instance_seq)
 
@@ -539,7 +539,7 @@ class ESM2(BaseModel, Scorer, MutationScorer, ConditionalMutationScorer, Transfo
             )
 
         # Validate positions
-        target = self.system[0]
+        target = self.system.biopolymer(0)
         for instance, pos in zip(instances, positions):
             self.valid_positions(
                 [pos], instance=instance, entities=0, raise_invalid=True

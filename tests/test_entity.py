@@ -1,4 +1,4 @@
-from evedesign.system import System, Entity, DNA, SystemInstance, EntityInstance, Protein, Ligand
+from evedesign.system import System, DNA, SystemInstance, EntityInstance, Protein, Ligand
 
 
 def test_system_validation():
@@ -39,7 +39,7 @@ def test_apply_instance_takes_rep_from_instance():
 
     assert "".join(updated[0].rep) == "WYFG"
     # entity-level attributes carry over
-    assert updated[0].first_index == 5
+    assert updated.biopolymer(0).first_index == 5
 
 
 def test_apply_instance_normalizes_inserts_and_deletions():
@@ -63,7 +63,8 @@ def test_apply_instance_keeps_ligand_rep_type():
         EntityInstance(rep="CCO"),
     ]))
 
-    assert updated[1].ligand_rep_type == "smiles"
+    updated_entity = updated[1]
+    assert isinstance(updated_entity, Ligand) and updated_entity.ligand_rep_type == "smiles"
 
 
 def test_apply_instance_falls_back_to_entity_rep():

@@ -9,7 +9,7 @@ from loguru import logger
 from evedesign.model import (
     BaseModel, Scorer, Generator, MutationScorer, ConditionalMutationScorer, assign_scores_to_instances
 )
-from evedesign.system import System, SystemInstance
+from evedesign.system import System, SystemInstance, Protein
 from evedesign.structure import Structure
 from evedesign.utils import ensure_sequence, model_param_context
 from evedesign.types import DeviceType, StatusCallback, BatchSize, EntityPosList
@@ -225,7 +225,7 @@ class LigandMPNN(BaseModel, Scorer, Generator, MutationScorer, ConditionalMutati
 
         # Check that all entities are proteins with structures
         for entity in system:
-            if entity.type != "protein":
+            if not isinstance(entity, Protein):
                 return False, "Can only handle protein entities"
             if not entity.defined_sequence():
                 return False, "Entity must have defined rep sequence"

@@ -127,7 +127,7 @@ def test_transform_embeds_in_latent_space() -> None:
 def test_generate_samples_sequences() -> None:
     """Sample new sequences from the VAE prior via generate()."""
     system = _synthetic_system()
-    target = system[0]
+    target = system.biopolymer(0)
     model = EVE(
         model_hyperparameters=_small_hyperparameters(),
         model_checkpoint_path=None,

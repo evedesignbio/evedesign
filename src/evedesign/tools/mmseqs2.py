@@ -12,7 +12,7 @@ from loguru import logger
 
 from evedesign import __version__
 from evedesign.tools.api_utils import _request_with_retries
-from evedesign.system import System, Entity
+from evedesign.system import System, BiopolymerEntity
 from evedesign.sequence import read_fasta, Sequence, Sequences
 
 
@@ -89,7 +89,7 @@ def filter_sequences_mmseqs(
 
 
 def filter_entity_sequences_mmseqs(
-    entity: Entity,
+    entity: BiopolymerEntity,
     target_num_sequences: int = 3000,
     brackets: SequenceType[float]=(0.2, 0.4, 0.6, 0.8, 1.0),
     max_seq_id: float | None = 0.95,
@@ -488,7 +488,7 @@ def add_sequences_mmseqs2(
 
         if seqs:
             sequences = Sequences(seqs, aligned=True, format="a3m", query=rep)
-            system[entity_idx].sequences = sequences
+            system.biopolymer(entity_idx).sequences = sequences
 
     return system
 

@@ -1,7 +1,8 @@
 from biotite.sequence.align import align_optimal, SubstitutionMatrix
 from biotite.sequence import ProteinSequence, NucleotideSequence
 from evedesign.structure import Structure
-from evedesign.system import Entity
+from evedesign.system import Entity, Protein
+
 
 def map_structure_chain_to_entity_pairwise(
     entity: Entity,
@@ -54,7 +55,7 @@ def map_structure_chain_to_entity_pairwise(
     chain_seq = "".join(res_df.res_name_oneletter)
     entity_seq = "".join(entity.rep)
 
-    if entity.type == "protein":
+    if isinstance(entity, Protein):
         chain_seq = ProteinSequence(chain_seq)
         entity_seq = ProteinSequence(entity_seq)
         matrix = SubstitutionMatrix.std_protein_matrix()
