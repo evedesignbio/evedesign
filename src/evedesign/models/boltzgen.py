@@ -19,7 +19,7 @@ from evedesign.models.boltz.convert_design import (
     parse_design_output,
     system_to_boltzgen_yaml,
 )
-from evedesign.system import System, SystemInstance
+from evedesign.system import System, SystemInstance, BiopolymerEntity
 from evedesign.types import DeviceType, EntityPosList, StatusCallback
 from evedesign.utils import ensure_sequence
 
@@ -201,7 +201,7 @@ class BoltzGenGenerator(BaseModel, Generator):
                     "supported."
                 )
 
-            if entity.deletions:
+            if isinstance(entity, BiopolymerEntity) and entity.deletions:
                 return False, (
                     f"Entity {i} sets deletions, which BoltzGen cannot "
                     "express."
