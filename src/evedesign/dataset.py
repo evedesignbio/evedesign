@@ -58,9 +58,11 @@ class LabeledInstanceDataset:
                     f"Length of instances and values for series {name} does not agree for training set"
                 )
 
-            if not np.isfinite(series).all():
+            defined_values = [v for v in series if v is not None]
+            if not np.isfinite(defined_values).all():
                 raise ValueError(
-                    f"Series {name} contains non-finite values (nan, inf or -inf)"
+                    f"Series {name} contains non-finite values (nan, inf or -inf). "
+                    "Missing values must be encoded with None."
                 )
 
         def _validate_split_or_raise(split_to_check, required_keys, split_name):
