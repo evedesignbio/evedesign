@@ -49,7 +49,7 @@ def status_progress(
         status_callback("running", progress, None)
 
 def shorten(text: str, max_len=50):
-    return (text[:max_len] + "...") if len(text) > 50 else text
+    return (text[:max_len] + "...") if len(text) > max_len else text
 
 def str_to_np_char_view(x: Sequence[str]):
     """

@@ -451,7 +451,7 @@ class StructureFile:
         -------
         Loaded structure
         """
-        # fetch as bCIF by default for quicker fetching/loading
+        # fetch as CIF by default
         pdb_data = rcsb.fetch(pdb_id, format="cif")
         return cls(pdb_data, format="cif")
 

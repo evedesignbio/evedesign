@@ -48,9 +48,10 @@ class MotifRestraint(BaseModel, Scorer, MutationScorer, ConditionalMutationScore
 
     # core properties
     requires_target: bool = False
-    requires_fixed_length: bool = False
-    handles_deletions: bool = True
-    handles_insertions: bool = True
+    # will need to add proper position mapping to reference to handle insertions/deletion
+    requires_fixed_length: bool = True
+    handles_deletions: bool = False
+    handles_insertions: bool = False
     requires_gpu: bool = False
     supports_gpu: bool = False
     supports_gpu_parallel: bool = False
@@ -289,7 +290,7 @@ class ExposedMotifRestraint(MotifRestraint):
         status_done(status_callback, "Finished scoring")
 
         # returns shallow copy
-        instances_with_scores =  assign_scores_to_instances(
+        instances_with_scores = assign_scores_to_instances(
             instances, scores
         )
 
@@ -300,6 +301,6 @@ class ExposedMotifRestraint(MotifRestraint):
             if "sites" not in instances_with_scores[idx].metadata:
                 instances_with_scores[idx].metadata["sites"] = []
 
-            instances_with_scores[idx].metadata["sites"].append(cur_metadata)
+            instances_with_scores[idx].metadata["sites"].extend(cur_metadata)
 
         return instances_with_scores
