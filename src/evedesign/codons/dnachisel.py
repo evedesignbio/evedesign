@@ -445,7 +445,7 @@ class DNAChiselCodonOptimizer(ProteinToDnaOptimizer):
          iii. "score" with optimization score (should be set to NaN if not available)
         """
         # verify that valid entity is selected
-        if not 0 <= entity <= len(system):
+        if not 0 <= entity < len(system):
             raise ValueError("Invalid entity index")
 
         if system[entity].type != "protein":
