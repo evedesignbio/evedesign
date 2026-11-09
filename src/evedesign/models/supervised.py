@@ -470,7 +470,7 @@ class SupervisedPredictorOnEmbeddingsScores(SupervisedBaseModel, Scorer, Mutatio
                 if self._is_classifier:
                     # copy so we don't modify list above
                     y_pred = y_pred.copy()
-                    y_pred[y_pred == -np.inf] = np.finfo(np.float64).tiny
+                    y_pred[y_pred == -np.inf] = np.finfo(np.float64).min
 
                 # compute evaluation scores
                 for name, eval_score in self._eval_scores.items():
