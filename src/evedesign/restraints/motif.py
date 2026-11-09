@@ -301,6 +301,6 @@ class ExposedMotifRestraint(MotifRestraint):
             if "sites" not in instances_with_scores[idx].metadata:
                 instances_with_scores[idx].metadata["sites"] = []
 
-            instances_with_scores[idx].metadata["sites"].append(cur_metadata)
+            instances_with_scores[idx].metadata["sites"].extend(cur_metadata)
 
         return instances_with_scores
