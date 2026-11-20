@@ -43,6 +43,11 @@ boltzgen = ["boltzgen>=0.3,<0.4"]
 umap = ["umap-learn"]
 gpytorch = ["torch", "gpytorch"]
 notebooks = ["py3Dmol"]
+# evedesign.proteingym (dataset conversion) and the evedesign-proteingym runner
+proteingym = ["proteingym-base>=0.1,<0.2", "polars", "typer", "rich", "dill"]
+
+[project.scripts]
+evedesign-proteingym = "evedesign.proteingym_runner:app"
 
 [project.urls]
 Documentation = "https://github.com/evedesignbio/evedesign#readme"
@@ -86,6 +91,8 @@ exclude_lines = [
 
 [tool.uv]
 override-dependencies = [
+    # proteingym-base 0.1.0 caps biotite <2.0; evedesign needs >=2.0
+    "biotite>=2.0",
     { package = { name = "boltz" }, dependencies = ["numpy>=2.0", "scipy>=1.14", "numba>=0.64", "biopython>=1.85"] },
     { package = { name = "boltzgen" }, dependencies = ["numpy>=2.0", "numba>=0.64"] },
 ]
