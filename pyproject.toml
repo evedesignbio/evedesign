@@ -47,7 +47,7 @@ notebooks = ["py3Dmol"]
 proteingym = ["proteingym-base>=0.1,<0.2", "polars", "typer", "rich", "dill"]
 
 [project.scripts]
-evedesign-proteingym = "evedesign.proteingym_runner:app"
+evedesign-proteingym = "evedesign.proteingym:app"
 
 [project.urls]
 Documentation = "https://github.com/evedesignbio/evedesign#readme"
