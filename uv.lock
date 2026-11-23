@@ -1,5 +1,5 @@
 version = 1
-revision = 3
+revision = 5
 requires-python = ">=3.12"
 resolution-markers = [
     "python_full_version >= '3.15' and sys_platform == 'win32'",
@@ -20,7 +20,6 @@ resolution-markers = [
 overrides = [
     { package = { name = "boltz" }, dependencies = [{ name = "numpy", specifier = ">=2.0" }, { name = "scipy", specifier = ">=1.14" }, { name = "numba", specifier = ">=0.64" }, { name = "biopython", specifier = ">=1.85" }] },
     { package = { name = "boltzgen" }, dependencies = [{ name = "numpy", specifier = ">=2.0" }, { name = "numba", specifier = ">=0.64" }] },
-    { name = "biotite", specifier = ">=2.0" },
 ]
 
 [[package]]
@@ -1263,7 +1262,7 @@ requires-dist = [
     { name = "polars", marker = "extra == 'proteingym'" },
     { name = "prody", marker = "extra == 'mpnn'" },
     { name = "promb", marker = "extra == 'promb'" },
-    { name = "proteingym-base", marker = "extra == 'proteingym'", specifier = ">=0.1,<0.2" },
+    { name = "proteingym-base", marker = "extra == 'proteingym'", specifier = ">=0.2,<0.3" },
     { name = "py3dmol", marker = "extra == 'notebooks'" },
     { name = "pyyaml", marker = "extra == 'boltz2fold'" },
     { name = "pyyaml", marker = "extra == 'boltz2fold-cuda'" },
@@ -3311,7 +3310,7 @@ wheels = [
 
 [[package]]
 name = "proteingym-base"
-version = "0.1.0"
+version = "0.2.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "biopython" },
@@ -3327,9 +3326,9 @@ dependencies = [
     { name = "toml" },
     { name = "typer" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/d3/eb/8fe36fca8ff37721eacf9924ac9185e84b0689a0db19ad1c91042bbee34c/proteingym_base-0.1.0.tar.gz", hash = "sha256:533e10816cc074de14fc5f1efba9afce9d917ad577291eb437fde2a65a1c9c6e", size = 4964847, upload-time = "2026-11-20T17:51:17.079Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/37/52/f06e711f2a8933756fc92ca5a473d4197958332501409fd60df208f78fa2/proteingym_base-0.2.0.tar.gz", hash = "sha256:faec0dd6efca95a6b4b215ed8800017cfb86ecc51a0b4032228ff435ab15a35d", size = 4964798, upload-time = "2026-11-23T19:12:25.942Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/e7/62/450f67c89a80e584c47633712a37d5f43f669a7fb9e0ff269c1a8c21481c/proteingym_base-0.1.0-py3-none-any.whl", hash = "sha256:85ee86cab36041aa3597b3d987a3f58be90405e517e2f19d474bd1b749be337d", size = 67078, upload-time = "2026-11-20T17:51:15.876Z" },
+    { url = "https://files.pythonhosted.org/packages/b8/13/66ef663c4a3882fd983403aff38fbc4b0ef375a4dc061fc01b9c28428c0d/proteingym_base-0.2.0-py3-none-any.whl", hash = "sha256:74076095173530fcd265dfb08ede0e096b556c6629633dcb0e800734964ae13f", size = 67147, upload-time = "2026-11-23T19:12:24.163Z" },
 ]
 
 [[package]]
