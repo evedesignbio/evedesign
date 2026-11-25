@@ -12,10 +12,11 @@ import pandas as pd
 import pytest
 
 from evedesign.model import BaseModel, ConditionalMutationScorer, Generator, MutationScorer, Scorer
-from evedesign.remote import Infra, Target, codec, open_model, open_built, session
-from evedesign.remote.config import derive_seed
+from evedesign.remote import Infra, codec, open_built, open_model, reload_model, session
+from evedesign.remote.config import Target, derive_seed
 from evedesign.remote.protocol import RemoteError
 from evedesign.remote.surface import declared_surface, surface_hash
+from evedesign.restraints.physicochemical import MolecularWeightRestraint
 from evedesign.remote.launchers import Launcher, container_argv, gpu_flags
 from evedesign.remote.transport import Transport
 
@@ -26,6 +27,8 @@ LOCAL = Target(name="in-process", launcher="command", command=("in-process",))
 
 class InProcessTransport(Transport):
     """A worker Session in this process, behind the real framing and codec."""
+
+    killed = False
 
     def __init__(self) -> None:
         from evedesign.remote import worker
@@ -40,8 +43,8 @@ class InProcessTransport(Transport):
     def _receive(self):
         return self._reply
 
-    def _terminate(self) -> None:
-        pass
+    def _terminate(self, kill: bool = False) -> None:
+        self.killed = kill
 
 
 @pytest.fixture
@@ -115,9 +118,8 @@ def test_score_all_preserves_order_and_overlaps_calls():
 # --- proxies ---------------------------------------------------------------------
 
 def test_proxy_behaves_like_the_model(local, system):
-    from evedesign.restraints.physicochemical import MolecularWeightRestraint
 
-    with open_model(local, MolecularWeightRestraint, seed=3, lower_bound=2000, upper_bound=2600) as m:
+    with open_model(local, MW, seed=3) as m:
         # conformance by registration; named after the remote class
         assert isinstance(m, Scorer) and isinstance(m, ConditionalMutationScorer)
         assert isinstance(m, MutationScorer) and isinstance(m, BaseModel) and not isinstance(m, Generator)
@@ -143,32 +145,166 @@ def test_proxy_behaves_like_the_model(local, system):
         assert m.provenance["models"][0]["args"] == {"lower_bound": 2000, "upper_bound": 2600}
         assert m.provenance["environment"]["seed"] == 3
         assert m.provenance["launcher"]["cuda_visible_devices"] == ""          # CPU-only: no GPU
+        assert m._label == f"{MW['class']}@in-process"
+
+
+GIBBS = "evedesign.samplers.gibbs:GibbsSampler"
 
 
 def test_open_built_builds_nested_models_and_returns_ready(local, system):
-    with pytest.raises(RemoteError, match="use open_built"):
-        open_model(local, {"class": "evedesign.samplers.gibbs:GibbsSampler", "args": {"scorers": [MW]}})
+    with pytest.raises(ValueError, match="opened with open_built"):
+        open_model(local, {"class": GIBBS, "models": {"scorers": [MW]}})
 
-    with open_built(local, "evedesign.samplers.gibbs:GibbsSampler", system,
-                   scorers=[PI, MW], weights=[1.0, 0.5], num_sweeps=1) as sampler:
+    spec = {"class": GIBBS, "args": {"weights": [1.0, 0.5], "num_sweeps": 1}, "models": {"scorers": [PI, MW]}}
+    with open_built(local, spec, system) as sampler:
         assert isinstance(sampler, Generator) and sampler.ready and sampler.system is system
         designs = sampler.generate(num_designs=2)
         assert [c["name"] for c in designs[0].metadata["scores"]] == [
             "IsoelectricPointRestraint", "MolecularWeightRestraint"]
-        assert [r["class"].rpartition(":")[2] for r in sampler.provenance["models"]] == [
-            "IsoelectricPointRestraint", "MolecularWeightRestraint", "GibbsSampler"]
+        records = sampler.provenance["models"]
+        assert [r["class"].rpartition(":")[2] for r in records] == [
+            "IsoelectricPointRestraint", "MolecularWeightRestraint", "GibbsSampler"]  # children first
+        assert all("stats" in r and "citations" in r for r in records)
         assert len(sampler.fetch_serialized()) == 3
+    with pytest.raises(ValueError, match="needs a system"):
+        open_built(local, spec)
+
+
+def test_nested_models_are_explicit():
+    from evedesign.remote.spec import as_spec
+
+    with pytest.raises(ValueError, match=r"\['scorers'\] given in both"):
+        as_spec({"class": GIBBS, "args": {"scorers": []}, "models": {"scorers": [MW]}})
+    with pytest.raises(ValueError, match=r"spec.models.scorers\[1\]: unknown fields \['variant'\]"):
+        as_spec({"class": GIBBS, "models": {"scorers": [MW, {"key": "esm2", "variant": "650M"}]}})
+    with pytest.raises(TypeError, match=r"spec.models.scorers\[0\]: a spec is a dictionary"):
+        as_spec({"class": GIBBS, "models": {"scorers": ["esm2"]}})
+    with pytest.raises(ValueError, match="either 'key' or 'class'"):
+        as_spec({"key": "a", "class": "b.c:D"})
+    with pytest.raises(ValueError, match="'rebuild' only applies"):
+        as_spec({"key": "a", "rebuild": True})
+    with pytest.raises(ValueError, match="takes only"):
+        as_spec({"serialized": b"x", "args": {}})
+
+
+class Holder(MolecularWeightRestraint):
+    """Reports a free-form argument through its declared `name`."""
+
+    def __init__(self, payload, **kwargs):
+        super().__init__(**kwargs)
+        self.payload = payload
+
+    @property
+    def name(self):
+        return repr(self.payload)
+
+
+def test_args_are_data_and_never_searched_for_models(local):
+    # user data shaped like a spec stays data: only `models` holds models
+    payload = {"class": "os:system", "wrap": ["x:y"], "args": {"cmd": "id"}}
+    spec = {"class": f"{__name__}:Holder", "args": {"payload": payload, "lower_bound": 0, "upper_bound": 1}}
+    with open_model(local, spec) as m:
+        assert m.name == repr(payload)
+
+
+def test_stored_models_load_at_the_root_and_nested(local, system):
+    with open_built(local, MW, system) as m:
+        (blob,) = m.fetch_serialized()
+
+    with reload_model(local, blob) as again:                     # short for {"serialized": blob}
+        assert again.ready and again.system == system
+        assert again.provenance["models"][0]["loaded"] and not again.provenance["models"][0]["rebuilt"]
+        assert again.provenance["spec"]["serialized"] == f"<{len(blob)} bytes>"
+
+    other = system.__class__([type(system[0])(rep="MKTAYIAKQRQISFVKSHFSRQAA", id="A")])
+    with open_built(local, {"serialized": blob, "rebuild": True}, other) as rebuilt:
+        assert rebuilt.system is other and rebuilt.provenance["models"][0]["rebuilt"]
+    with pytest.raises(RemoteError, match="does not agree"):
+        open_built(local, {"serialized": blob}, other)
+
+    spec = {"class": GIBBS, "args": {"num_sweeps": 1}, "models": {"scorers": [{"serialized": blob}, PI]}}
+    with open_built(local, spec, system) as sampler:
+        assert [r["loaded"] for r in sampler.provenance["models"]] == [True, False, False]
+        sampler.generate(num_designs=1)
+
+
+CARD = """---
+key: mw
+name: Molecular weight
+model_class: evedesign.restraints.physicochemical:MolecularWeightRestraint
+hyper_parameters: {lower_bound: 2000, upper_bound: 2600}
+---
+"""
+
+
+def test_the_card_applies_to_its_key_only(local, tmp_path, monkeypatch):
+    from evedesign.remote import worker
+
+    card = tmp_path / "README.md"
+    card.write_text(CARD)
+    monkeypatch.setattr(worker, "CARD_PATH", card)
+
+    def opened(model):
+        with open_model(local, model) as m:
+            return m.provenance["models"][0]
+
+    for model in (None, "mw", {"key": "mw"}):
+        record = opened(model)
+        assert record["via"] == "model_card" and record["args"] == {"lower_bound": 2000, "upper_bound": 2600}
+    # a class path means the class as is, even the card's own: the card adds nothing
+    record = opened({"class": P + "MolecularWeightRestraint", "args": {"lower_bound": 1, "upper_bound": 2}})
+    assert record["via"] == "class" and record["args"] == {"lower_bound": 1, "upper_bound": 2}
+    assert opened({"key": "mw", "args": {"upper_bound": 2700}})["args"]["upper_bound"] == 2700   # spec args win
+    with pytest.raises(RemoteError, match="the image's model card is for 'mw'"):
+        opened("MW")                                                           # exact match only
+    with pytest.raises(RemoteError, match="card is for 'mw'"):
+        opened("Molecular weight")                                            # the key, not the name
+    record = opened({"class": P + "IsoelectricPointRestraint", "args": {"lower_bound": 5, "upper_bound": 7}})
+    assert record["via"] == "class"                                            # another class: no card
+
+    card.write_text(CARD.replace("key: mw\n", ""))
+    assert opened("Molecular weight")["via"] == "model_card"                  # without a key: the name
 
 
 def test_sessions_seed_models_and_refuse_foreign_proxies(local):
     with session(seed=42) as s:
-        a = s.open_model(local, P + "MolecularWeightRestraint", args={"lower_bound": 1, "upper_bound": 2})
+        a = s.open_model(local, {"class": P + "MolecularWeightRestraint", "args": {"lower_bound": 1, "upper_bound": 2}})
         b = s.open_model(local, MW)
         seeds = [x.provenance["environment"]["seed"] for x in (a, b)]
         assert None not in seeds and seeds[0] != seeds[1]                    # derived per model
         assert a.provenance["models"][0]["args"]["lower_bound"] == 1
         with pytest.raises(codec.CodecError, match="open_built"):
-            s.open_model(local, {"class": "evedesign.samplers.gibbs:GibbsSampler", "args": {"scorers": [a]}})
+            s.open_model(local, {"class": P + "MolecularWeightRestraint", "args": {"other": a}})
+
+
+def test_open_all_starts_workers_together_and_cleans_up(local, monkeypatch):
+    import threading
+    import time
+
+    import evedesign.remote.api as api
+
+    started, transports = [], []
+
+    def slow_launch(target, image):
+        started.append(time.perf_counter())
+        time.sleep(0.2)
+        transports.append(InProcessTransport())
+        return transports[-1]
+
+    monkeypatch.setattr(api, "launch", slow_launch)
+    with session(seed=1) as s:
+        pi, mw = s.open_all([(local, PI), (local, MW, {"seed": 5})])
+        assert max(started) - min(started) < 0.15 and type(pi).__name__ == "IsoelectricPointRestraint"
+        assert mw.provenance["environment"]["seed"] == 5 and not mw.ready
+        with pytest.raises(ValueError, match="only 'seed'"):
+            s.open_all([(local, MW, {"sed": 1})])
+
+        transports.clear()
+        with pytest.raises(RemoteError) as err:
+            s.open_all([(local, MW), (local, "no.such.module:Model")])
+        assert "entry 1 (no.such.module:Model" in "".join(err.value.__notes__)
+        assert len(transports) == 2 and transports[0]._closed and len(s.models) == 2   # the good one closed
+    assert threading.active_count() >= 1
 
 
 def test_incompatible_worker_is_refused(local, monkeypatch):
@@ -179,39 +315,48 @@ def test_incompatible_worker_is_refused(local, monkeypatch):
         open_model(local, MW)
 
 
-def test_models_are_named_like_locally():
-    from evedesign.restraints.physicochemical import MolecularWeightRestraint
+def test_models_are_named_by_a_string_a_spec_or_nothing():
+    from evedesign.remote.spec import as_spec, describe
 
-    from evedesign.remote.api import as_spec
-
-    assert as_spec("esm2", {"device": "cuda"}) == {"key": "esm2", "args": {"device": "cuda"}}
+    assert as_spec("esm2") == {"key": "esm2"}
+    assert as_spec("esm2:650M") == {"key": "esm2:650M"}                       # no dotted module: a key
     assert as_spec("evedesign.models.esm2:ESM2") == {"class": "evedesign.models.esm2:ESM2"}
-    assert as_spec(MolecularWeightRestraint)["class"].endswith(":MolecularWeightRestraint")
-    assert as_spec({"key": "x", "args": {"a": 1}}, {"b": 2})["args"] == {"a": 1, "b": 2}
-    assert as_spec(None) == {}
+    assert as_spec(None) == {} and describe({}) == "card"
+    with pytest.raises(TypeError, match="a string, a spec dictionary or nothing"):
+        as_spec(MolecularWeightRestraint)
 
 
 # --- config ----------------------------------------------------------------------
 
 INFRA = {
-    "defaults": {"launcher": "docker", "gpus": "inherit"},
     "targets": {
         "esm2": {"image": "ghcr.io/proteingym/esm2:2026.11"},
-        "eve": {"image": "eve:latest", "gpus": "device=1", "env": {"A": "1"}, "mounts": ["/w:/models:ro"]},
-        "esmc": {"launcher": "apptainer", "image": "/srv/sif/esmc.sif"},
-        "esm2-modal": {"launcher": "modal", "image": "ghcr.io/x/esm2@sha256:ab", "volumes": {"/models": "w"}},
+        "eve": {"image": "eve:latest", "gpus": [1], "env": {"A": "1"}, "mounts": ["/w:/models:ro"],
+                "start_timeout": 600, "call_timeout": 3600},
+        "esmc": {"launcher": "apptainer", "image": "/srv/sif/esmc.sif", "gpus": "none"},
+        "esm2-modal": {"launcher": "modal", "image": "ghcr.io/x/esm2@sha256:ab", "gpu_type": "L40S",
+                       "volumes": {"/models": "w"}},
+        "venv": {"launcher": "command", "command": ["/opt/venv/bin/python", "-m", "evedesign.remote.worker"]},
     },
 }
 
 
-def test_convention_targets_need_no_file(tmp_path):
-    infra = Infra(defaults={"gpus": "none"}, sif_dir=tmp_path)
-    assert infra.resolve("docker:esm2").image == "esm2:latest"
-    assert infra.resolve("docker:ghcr.io/x/esm2@sha256:ab").image == "ghcr.io/x/esm2@sha256:ab"
-    assert infra.resolve("apptainer:esm2").image == str(tmp_path / "esm2.sif")
+def test_shortcuts_name_a_launcher_and_an_image():
+    infra = Infra()
+    assert infra.resolve("docker:esm2").image == "esm2"                       # as written: no :latest added
+    assert infra.resolve("docker:ghcr.io/x/esm2:2026.11").image == "ghcr.io/x/esm2:2026.11"   # first colon only
+    assert infra.resolve("docker:localhost:5000/esm2@sha256:ab").image == "localhost:5000/esm2@sha256:ab"
+    assert infra.resolve("apptainer:/srv/sif/esm2.sif").image == "/srv/sif/esm2.sif"
     assert infra.resolve("modal:ghcr.io/x/esm2:1").is_network
+    assert infra.resolve("docker:esm2").gpus == "auto"
+    with pytest.raises(ValueError, match="unknown launcher 'esm2'"):
+        Infra.from_dict(INFRA).resolve("esm2:650M")                           # never an infra lookup
+    with pytest.raises(ValueError, match="has no shortcut"):
+        infra.resolve("command:python")
     with pytest.raises(KeyError, match="unknown target"):
         infra.resolve("esm2")
+    with pytest.raises(ValueError, match="may not contain a colon"):
+        Infra.from_dict({"targets": {"esm2:gpu": {"image": "i"}}})
 
 
 @pytest.mark.parametrize("suffix", [".toml", ".yaml", ".json"])
@@ -225,29 +370,48 @@ def test_infra_is_plain_data_and_round_trips(tmp_path, suffix):
     write = {".toml": tomli_w.dumps, ".yaml": yaml.safe_dump, ".json": json.dumps}[suffix]
     (tmp_path / f"infra{suffix}").write_text(write(INFRA))
     assert Infra.coerce(tmp_path / f"infra{suffix}").to_dict() == INFRA
+    eve = Infra.from_dict(INFRA).resolve("eve")
+    assert eve.gpus == ("1",) and eve.start_timeout == 600 and eve.call_timeout == 3600
 
 
-def test_inline_targets_locks_and_typos():
+def test_one_off_targets_settings_and_typos():
+    inline = Infra().resolve({"launcher": "docker", "image": "eve:big", "gpus": "none"})
+    assert inline.image == "eve:big" and inline.gpus == "none" and inline.name == "docker:eve:big"
+    with pytest.raises(ValueError, match="unknown fields"):
+        Infra.from_dict({"targets": {"x": {"imgae": "typo"}}})
+    with pytest.raises(ValueError, match="unknown keys"):
+        Infra.from_dict({"defaults": {"launcher": "docker"}})                 # no defaults: each target says
+    with pytest.raises(ValueError, match=r"unknown fields \['volumes'\] for launcher 'docker'"):
+        Infra.from_dict({"targets": {"x": {"image": "i", "volumes": {"/m": "v"}}}})
+    with pytest.raises(ValueError, match="use volumes"):
+        Infra.from_dict({"targets": {"x": {"launcher": "modal", "image": "i", "mounts": ["/a:/b"]}}})
+    with pytest.raises(ValueError, match="only for the command launcher"):
+        Infra().resolve({"image": "i", "command": ["serve"]})
+    with pytest.raises(ValueError, match="needs a command"):
+        Infra().resolve({"launcher": "command"})
+    for gpus, match in (("share", "gpus is"), ("device=1", "gpus is"), (1, "gpus is"), ([], "device numbers"),
+                        (["a"], "device")):
+        with pytest.raises(ValueError, match=match):
+            Infra().resolve({"image": "i", "gpus": gpus})
+    with pytest.raises(ValueError, match="gpu_type"):
+        Infra().resolve({"launcher": "modal", "image": "i", "gpus": [0]})
+    for bad in (0, True, "10"):
+        with pytest.raises(ValueError, match="positive number"):
+            Infra().resolve({"image": "i", "call_timeout": bad})
+
+
+def test_locks_pin_named_targets_only(tmp_path):
+    from evedesign.remote.provenance import write_lock
+
     infra = Infra.coerce(INFRA, lock={"esm2": "ghcr.io/proteingym/esm2@sha256:ab"})
     assert infra.resolve("esm2").image.endswith("@sha256:ab") and infra.resolve("esm2").pinned
     with pytest.raises(LookupError, match="not in the lock"):
         infra.resolve("eve")
-    inline = Infra.coerce(None).resolve({"launcher": "docker", "image": "eve:big", "gpus": "none"})
-    assert inline.image == "eve:big" and inline.gpus == "none"
-    with pytest.raises(ValueError, match="unknown fields"):
-        Infra.from_dict({"targets": {"x": {"imgae": "typo"}}})
-    with pytest.raises(ValueError, match="unknown keys"):
-        Infra.from_dict({"target": {}})
-    with pytest.raises(ValueError, match=r"unknown fields \['volumes'\] for launcher 'docker'"):
-        Infra.from_dict({"targets": {"x": {"image": "i", "volumes": {"/m": "v"}}}})
-    # a default only reaches targets whose launcher has the field
-    infra = Infra.from_dict({"defaults": {"gpu": "H100"}, "targets": {"d": {"image": "i"},
-                                                                     "m": {"launcher": "modal", "image": "i"}}})
-    assert infra.resolve("m").options["gpu"] == "H100" and "gpu" not in infra.resolve("d").options
-    with pytest.raises(ValueError, match="infra defaults: unknown fields"):
-        Infra.from_dict({"defaults": {"gpuu": "H100"}})
-    with pytest.raises(ValueError, match="use volumes"):
-        Infra.from_dict({"targets": {"x": {"launcher": "modal", "image": "i", "mounts": ["/a:/b"]}}})
+    for target in ("docker:esm2", {"image": "esm2"}):
+        with pytest.raises(ValueError, match="only named targets"):
+            infra.resolve(target)
+    with pytest.raises(ValueError, match="named targets of the infra file only"):
+        write_lock(Infra.from_dict(INFRA), ["docker:esm2"], tmp_path / "x.lock")
 
 
 def test_seeds_are_derived_deterministically():
@@ -264,17 +428,35 @@ def test_container_command_line(monkeypatch):
                     options={"network_mode": "none"})
     argv = container_argv(target, "img@sha256:1")
     assert argv[:6] == ["docker", "run", "-i", "--rm", "--init", "--label"]
-    assert "type=bind,source=/w,target=/models,readonly" in argv and argv[-2:] == ["img@sha256:1", "serve"]
+    assert "type=bind,source=/w,target=/models,readonly" in argv
+    # the worker by name, never through the image's entrypoint
+    assert argv[-5:] == ["--entrypoint", "python", "img@sha256:1", "-m", "evedesign.remote.worker"]
     assert argv[argv.index("--cpus") + 1] == "2.5" and argv[argv.index("--network") + 1] == "none"
     assert {"--cap-drop", "ALL", "no-new-privileges"} <= set(argv) and "--gpus" not in argv
     assert {"HOME=/tmp", "OMP_NUM_THREADS=2"} <= set(argv)
     # target.env by name only: values (tokens) stay out of argv, in the docker CLI's environment
     assert "HF_TOKEN" in argv and not any("secret" in a for a in argv)
     seen = {}
-    monkeypatch.setattr(launchers, "StdioTransport", lambda argv, description, env=None: seen.update(env))
+    monkeypatch.setattr(launchers, "StdioTransport",
+                        lambda argv, description, env=None, kill_argv=None: seen.update(env, argv=argv, kill=kill_argv))
     monkeypatch.setenv("HOME", "/home/me")
     launchers.get("docker").start(target, "img")
     assert seen["HF_TOKEN"] == "secret" and seen["HOME"] == "/home/me"  # the CLI keeps its own config
+    name = seen["argv"][seen["argv"].index("--name") + 1]
+    assert seen["kill"] == ["docker", "kill", name]                     # a timeout stops the container
+
+
+def test_apptainer_execs_the_worker(monkeypatch):
+    from evedesign.remote import launchers
+
+    monkeypatch.setattr("evedesign.remote.transport._has_nvidia", lambda: True)
+    seen = {}
+    monkeypatch.setattr(launchers, "StdioTransport",
+                        lambda argv, description, env=None: seen.update(argv=argv, env=env))
+    launchers.get("apptainer").start(Target(name="a", launcher="apptainer", image="x.sif", gpus=("2",)), "x.sif")
+    assert seen["argv"] == ["apptainer", "exec", "--containall", "--nv", "x.sif",
+                            "python", "-m", "evedesign.remote.worker"]
+    assert seen["env"]["APPTAINERENV_CUDA_VISIBLE_DEVICES"] == "2"
 
 
 def test_frame_limit_and_short_remote_errors(monkeypatch):
@@ -289,15 +471,6 @@ def test_frame_limit_and_short_remote_errors(monkeypatch):
         protocol.encode({"blob": b"x" * 200})
     err = protocol.RemoteError("ValueError", "bad", "Traceback ...\n  File \"/secret/path.py\"")
     assert str(err) == "ValueError: bad" and "/secret/path.py" in err.remote_traceback
-
-
-def test_worker_never_walks_a_pipeline_tree_itself(system):
-    from evedesign.remote import worker
-
-    # a pipeline tree may carry user data shaped like specs; only the pipeline's own code reads it
-    spec = {"key": "gibbs", "args": {"scorers": [], "kwargs": {"class": "os:system", "wrap": ["x:y"]}}}
-    with pytest.raises(ValueError, match="uses_gpu from the orchestrator"):
-        worker.Session().op_open_built(spec, system, schema="evedesign_server.schemas:GibbsSamplerSpec")
 
 
 def test_wrapping_imports_without_the_remote_extra():
@@ -316,8 +489,11 @@ def test_cpus_limit_threads_for_venvs(monkeypatch):
 
     from evedesign.remote import launchers
 
+    import types
+
     seen = {}
-    monkeypatch.setattr(launchers, "StdioTransport", lambda argv, description, env=None: seen.update(env))
+    monkeypatch.setattr(launchers, "StdioTransport",
+                        lambda argv, description, env=None: seen.update(env) or types.SimpleNamespace())
     transport.launch(Target(name="v", launcher="command", command=("python",), cpus=3, env=(("A", "1"),)), None)
     assert seen["OMP_NUM_THREADS"] == seen["OPENBLAS_NUM_THREADS"] == "3" and seen["A"] == "1"
 
@@ -340,10 +516,11 @@ def test_each_gpu_model_gets_its_own_device(monkeypatch):
     # CPU models are hidden from the GPUs and take no slot; GPU models alternate
     assert [assigned(docker, g) for g in (False, True, False, True, True)] == ["", "0", "", "1", "0"]
     assert assigned(Target(name="a", launcher="apptainer", image="x.sif"), True) == "3"  # host numbering
-    assert assigned(Target(name="s", image="img", gpus="share"), True) is None
-    assert assigned(Target(name="p", image="img", gpus="device=1"), True) is None
-    assert gpu_flags(Target(name="p", image="img", gpus="device=1")) == ["--gpus", "device=1"]
+    pinned = Target(name="p", image="img", gpus=(1, 3))
+    assert pinned.gpus == ("1", "3") and assigned(pinned, True) is None         # as launched
+    assert gpu_flags(pinned) == ["--gpus", '"device=1,3"']
     assert assigned(Target(name="n", image="img", gpus="none"), True) == ""
+    assert gpu_flags(Target(name="n", image="img", gpus="none")) == []
     assert assigned(Target(name="m", launcher="modal", image="img"), True) is None
 
     monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "")         # job got no GPU
@@ -398,7 +575,7 @@ def test_a_provider_is_a_small_launcher_plugin(monkeypatch, system):
     infra = Infra.from_dict({"targets": {"c": {"launcher": "cloud", "image": "reg/x@sha256:1", "machine": "a100"}}})
     target = infra.resolve("c")
     assert target.options == {"zone": "eu-west", "machine": "a100"} and target.is_network
-    assert infra.resolve("cloud:reg/y:1").image == "reg/y:1"                   # convention names work too
+    assert infra.resolve("cloud:reg/y:1").image == "reg/y:1"                   # shortcuts work too
     with pytest.raises(ValueError, match="unknown fields"):
         Infra.from_dict({"targets": {"c": {"launcher": "cloud", "image": "i", "region": "x"}}})
 
@@ -416,9 +593,137 @@ def test_modal_pulls_ecr_images_with_its_ecr_support():
 
     modal, _ = fake_modal.make(python="python", pythonpath="")
     ecr = registry_image(modal, "123456789012.dkr.ecr.eu-central-1.amazonaws.com/esm2@sha256:ab", "aws-ecr")
-    assert ecr.source == "aws_ecr" and ecr.secret.value == "aws-ecr"
+    assert ecr.source == "aws_ecr" and ecr.secret.value == "aws-ecr" and ecr.entrypoint is None
     ghcr = registry_image(modal, "ghcr.io/org/esm2@sha256:ab", "ghcr-pull")
     assert ghcr.source == "registry" and ghcr.secret.value == "ghcr-pull"
     assert registry_image(modal, "python:3.12-slim", None).secret is None
     with pytest.raises(ValueError, match="needs registry_secret"):
         registry_image(modal, "123456789012.dkr.ecr.us-east-1.amazonaws.com/x:1", None)
+
+
+# --- reproducibility, build_args, wrapped classes -----------------------------------
+
+def test_gibbs_seed_makes_remote_samplers_reproducible(local, system):
+    from evedesign.restraints.physicochemical import MolecularWeightRestraint
+    from evedesign.samplers.gibbs import GibbsSampler
+
+    with pytest.raises(ValueError, match="either rng or seed"):
+        GibbsSampler(scorers=[MolecularWeightRestraint(2000, 2600).build(system, None)],
+                     rng=np.random.default_rng(0), seed=0)
+
+    def run(seed):
+        # the sampler's own seed is a constructor argument; open_built's `seed` seeds the
+        # worker's global generators, which GibbsSampler does not use
+        spec = {"class": GIBBS, "args": {"num_sweeps": 1, "seed": seed}, "models": {"scorers": [MW]}}
+        with open_built(local, spec, system) as sampler:
+            return [str(d[0].rep) for d in sampler.generate(num_designs=4)]
+
+    assert run(7) == run(7) != run(8)
+
+
+class Recorder(MolecularWeightRestraint):
+    """Reports the build arguments it got, through its declared `name`."""
+
+    def build(self, system, data=None, status_callback=None, flag=None):
+        self.flag, self.data = flag, data
+        return super().build(system, None, status_callback)
+
+    @property
+    def name(self):
+        return f"flag={getattr(self, 'flag', None)} data={getattr(self, 'data', None)}"
+
+
+def test_open_model_applies_the_specs_build_args(local, system):
+    spec = {"class": f"{__name__}:Recorder", "args": {"lower_bound": 0, "upper_bound": 1},
+            "build_args": {"flag": "from-spec"}, "data": "spec-data"}
+    with open_model(local, spec) as m:
+        assert m.build(system).name == "flag=from-spec data=spec-data"   # the spec's, by default
+        assert m.build(system, "mine", flag="here").name == "flag=here data=mine"   # a call overrides them
+
+
+def subset_like(cls):
+    """A wrapper that, like system_subset_model, answers GPU questions through properties."""
+    class Wrapper(cls):
+        requires_gpu = property(lambda self: True)
+        supports_gpu = property(lambda self: True)
+
+    return Wrapper
+
+
+def test_wrapped_cpu_models_take_no_gpu():
+    from evedesign.model import system_subset_model
+    from evedesign.remote.worker import _uses_gpu
+    from evedesign.remote.wrapping import apply_wraps
+    from evedesign.restraints.physicochemical import MolecularWeightRestraint
+
+    assert not _uses_gpu(system_subset_model(MolecularWeightRestraint))          # direct use
+    assert not _uses_gpu(apply_wraps(MolecularWeightRestraint, [f"{__name__}:subset_like"]))
+    assert _uses_gpu(subset_like(MolecularWeightRestraint))                     # unknown: may use one
+
+
+# --- timeouts, datasets, workers without the server --------------------------------
+
+def test_start_timeout_stops_a_worker_that_never_answers():
+    import sys
+    import time
+
+    from evedesign.remote.api import probe
+
+    target = {"launcher": "command", "command": [sys.executable, "-c", "import time; time.sleep(60)"],
+              "start_timeout": 1}
+    started = time.perf_counter()
+    with pytest.raises(TimeoutError, match="command: hello took longer than 1s"):
+        probe(target)
+    assert time.perf_counter() - started < 10
+
+
+def test_call_timeout_stops_the_worker(local, monkeypatch, system):
+    import time
+
+    import evedesign.remote.api as api
+
+    class Slow(InProcessTransport):
+        def _receive(self):
+            if self._reply.get("type") == "result" and self.slow:
+                time.sleep(5)
+            return self._reply
+
+    transport = Slow()
+    transport.slow = False
+    monkeypatch.setattr(api, "launch", lambda target, image: (setattr(transport, "call_timeout", 0.5), transport)[1])
+    m = open_model(local, MW)
+    m.build(system)
+    transport.slow = True
+    with pytest.raises(TimeoutError, match="score took longer than 0.5s; the worker was stopped"):
+        m.score([system.rep_to_instance(True)])
+    assert transport.killed
+    from evedesign.remote.protocol import SessionLost
+
+    with pytest.raises(SessionLost, match="already closed"):
+        m.score([system.rep_to_instance(True)])
+    m.close()
+
+
+def test_datasets_cross_the_wire(system):
+    from evedesign.dataset import LabeledInstanceDataset
+
+    instances = [system.rep_to_instance(True) for _ in range(6)]
+    data = LabeledInstanceDataset(instances, {"y": [0.1, None, 2, 3.5, np.float64(4), 5]}, splits=("cv", 3),
+                                  final_train_val_split={"train": [0, 1, 2, 3], "val": [4, 5]})
+    out = codec.loads(codec.dumps({"data": data}))["data"]
+    assert isinstance(out, LabeledInstanceDataset) and out.serialize() == data.serialize()
+    assert out.labels["y"] == [0.1, None, 2.0, 3.5, 4.0, 5.0]
+    assert sorted(out.serialize()["splits"]) == ["cv0", "cv1", "cv2"]        # expanded, as plain lists
+    assert out.select("y")[2] == data.select("y")[2]
+
+
+def test_workers_run_without_evedesign_server(system):
+    import sys
+
+    # what a model image holds: evedesign alone
+    code = ("import sys; sys.modules['evedesign_server'] = None\n"
+            "from evedesign.remote.worker import main; main()")
+    target = {"launcher": "command", "command": [sys.executable, "-c", code], "call_timeout": 120}
+    spec = {"class": GIBBS, "args": {"num_sweeps": 1, "seed": 1}, "models": {"scorers": [PI, MW]}}
+    with open_built(target, spec, system) as sampler:
+        assert len(sampler.generate(num_designs=2)) == 2

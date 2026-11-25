@@ -103,7 +103,10 @@ def pin(target) -> dict[str, Any]:
 
 
 def write_lock(infra, names: list[str], path: str | Path) -> dict[str, Any]:
-    """Pin the given targets without running anything; output is provenance-shaped."""
+    """Pin the given named targets without running anything; output is provenance-shaped."""
+    unnamed = [name for name in names if name not in infra.targets]
+    if unnamed:
+        raise ValueError(f"a lock pins named targets of the infra file only, not {unnamed}")
     records = [{"launcher": pin(infra.resolve(name))} for name in names]
     data = {"kind": "evedesign-remote-lock", "models": records}
     Path(path).write_text(json.dumps(data, indent=2))

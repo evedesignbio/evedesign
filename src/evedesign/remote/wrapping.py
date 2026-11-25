@@ -53,13 +53,6 @@ def _wrap(cls: type, factory_path: str, args_json: str) -> type:
     except TypeError as exc:
         raise TypeError(f"wrap factory {factory_path}: {exc}") from None
     wrapped = factory(cls, **args)
-    if wrapped is not cls:
-        if "__wrapped__" not in vars(wrapped):
-            wrapped.__wrapped__ = cls  # for class-level questions, e.g. GPU use
-        # how this class was made, for as_spec(cls); from __dict__ since subclasses inherit it
-        inner = vars(cls).get("_evedesign_wrap")
-        wrapped._evedesign_wrap = {
-            "base": inner["base"] if inner else f"{cls.__module__}:{cls.__qualname__}",
-            "wrap": (inner["wrap"] if inner else []) + [{"factory": factory_path, "args": json.loads(args_json)}],
-        }
+    if wrapped is not cls and "__wrapped__" not in vars(wrapped):
+        wrapped.__wrapped__ = cls  # for class-level questions, e.g. GPU use
     return wrapped

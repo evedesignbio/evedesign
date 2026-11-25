@@ -28,13 +28,10 @@ def complex_():
 
 
 def test_apply_wraps(complex_):
-    from evedesign.remote.api import as_spec
-
     wrap = [SUBSET, {"factory": TAGGED, "args": {"label": "z"}}]
     cls = apply_wraps(MolecularWeightRestraint, wrap)
     assert cls.label == "z" and cls.__mro__[1].__name__ == "SubsetModel"      # first entry innermost
     assert apply_wraps(MolecularWeightRestraint, wrap) is cls                  # cached
-    assert as_spec(cls)["wrap"] == [{"factory": SUBSET, "args": {}}, {"factory": TAGGED, "args": {"label": "z"}}]
     model = cls(lower_bound=0, upper_bound=1e9).build(complex_, None, entity_subset=[1])
     assert {e for e, _ in model.positions(None)} == {1}
     with pytest.raises(TypeError, match="tagged.*lable"):
@@ -55,8 +52,9 @@ def test_remote_wrap_and_build_args(complex_, monkeypatch):
         assert m.system is complex_ and {e for e, _ in m.positions(None)} == {1}
 
     nested = {**MW, "wrap": [SUBSET], "build_args": {"entity_subset": [1]}}   # per nested spec
-    with open_built(LOCAL, "evedesign.samplers.gibbs:GibbsSampler", complex_,
-                    scorers=[nested, nested], num_sweeps=1) as sampler:
+    spec = {"class": "evedesign.samplers.gibbs:GibbsSampler", "args": {"num_sweeps": 1},
+            "models": {"scorers": [nested, nested]}}
+    with open_built(LOCAL, spec, complex_) as sampler:
         sampler.generate(num_designs=1)
         assert [r.get("wrap") for r in sampler.provenance["models"]][:2] == [[{"factory": SUBSET, "args": {}}]] * 2
         assert dill.loads(sampler.fetch_serialized()[0]).entity_subset == [1]
@@ -74,7 +72,6 @@ def pair(cls, a: int = 0, b: list | None = None):
 
 
 def test_wrapping_is_safe_with_user_specs():
-    from evedesign.remote.api import as_spec
     from evedesign.remote.wrapping import apply_wraps
 
     # the allowlist is checked before any import
@@ -86,7 +83,6 @@ def test_wrapping_is_safe_with_user_specs():
         apply_wraps(MolecularWeightRestraint, [{"factory": pair_, "args": {"b": [2], "a": 1}}])
     # a factory returning its input does not relabel the plain class
     assert apply_wraps(MolecularWeightRestraint, [f"{__name__}:keep"]) is MolecularWeightRestraint
-    assert "wrap" not in as_spec(MolecularWeightRestraint)
     # wrapped CPU models do not claim a GPU (wrappers expose these as properties)
     from evedesign.remote.worker import _uses_gpu
     assert not _uses_gpu(apply_wraps(MolecularWeightRestraint, [SUBSET]))

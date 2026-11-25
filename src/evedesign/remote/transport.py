@@ -19,8 +19,14 @@ from . import protocol
 from .config import Target
 
 
+_DEFAULT = object()
+
+
 class Transport:
     """A connection to one worker. Thread-safe: one request in flight at a time."""
+
+    # seconds one call may take (the target's call_timeout); None waits for ever
+    call_timeout: float | None = None
 
     def __init__(self, description: str) -> None:
         self.description = description
@@ -28,21 +34,52 @@ class Transport:
         self._ids = itertools.count(1)
         self._closed = False
 
-    # subclasses implement these three
+    # subclasses implement these three; _terminate(kill=True) must not wait for the worker
     def _send(self, data: bytes) -> None: ...
     def _receive(self) -> dict[str, Any]: ...
-    def _terminate(self) -> None: ...
+    def _terminate(self, kill: bool = False) -> None: ...
 
-    def request(self, op: str, /, **kwargs: Any) -> Any:
+    def _receive_within(self, timeout: float | None, op: str) -> dict[str, Any]:
+        """_receive, giving up after `timeout` seconds: the worker is then stopped, since a
+        stream cannot be resynchronised mid-frame."""
+        if timeout is None:
+            return self._receive()
+        outcome: dict[str, Any] = {}
+
+        def receive() -> None:
+            try:
+                outcome["reply"] = self._receive()
+            except BaseException as exc:  # noqa: BLE001 -- re-raised in the caller
+                outcome["error"] = exc
+
+        reader = threading.Thread(target=receive, daemon=True)
+        reader.start()
+        reader.join(timeout)
+        if reader.is_alive():
+            self._closed = True
+            self._terminate(kill=True)
+            raise TimeoutError(f"{self.description}: {op} took longer than {timeout:g}s; the worker was stopped")
+        if "error" in outcome:
+            raise outcome["error"]
+        return outcome["reply"]
+
+    def request(self, op: str, /, *, timeout: Any = _DEFAULT, **kwargs: Any) -> Any:
+        """Send one call and wait for its reply, for at most `timeout` seconds
+        (default: call_timeout)."""
         if self._closed:
             raise protocol.SessionLost(f"{self.description}: session already closed")
+        if timeout is _DEFAULT:
+            timeout = self.call_timeout
         with self._lock:
             msg_id = next(self._ids)
             # encoded first: a call too large to send fails here and leaves the session usable
             data = protocol.encode({"id": msg_id, "type": "call", "method": op, "kwargs": kwargs})
+            label = kwargs.get("method", op)
             try:
                 self._send(data)
-                reply = self._receive()
+                reply = self._receive_within(timeout, label)
+            except TimeoutError:
+                raise
             except (EOFError, BrokenPipeError, OSError) as exc:
                 self._closed = True
                 raise protocol.SessionLost(f"{self.description}: worker went away ({exc})") from exc
@@ -57,7 +94,7 @@ class Transport:
         if self._closed:
             return
         try:
-            self.request("close")
+            self.request("close", timeout=30 if self.call_timeout is None else min(30, self.call_timeout))
         except Exception:  # noqa: BLE001 -- closing a dead worker is fine
             pass
         self._closed = True
@@ -65,9 +102,17 @@ class Transport:
 
 
 class StdioTransport(Transport):
-    def __init__(self, argv: list[str], description: str, env: dict[str, str] | None = None) -> None:
+    """
+    A child process. `kill_argv`, if given, is run when the worker must be stopped at
+    once (a timeout): e.g. `docker kill <name>`, since killing the docker client alone
+    leaves a busy container running.
+    """
+
+    def __init__(self, argv: list[str], description: str, env: dict[str, str] | None = None,
+                 kill_argv: list[str] | None = None) -> None:
         super().__init__(description)
         self.argv = argv
+        self._kill_argv = kill_argv
         self._ready = False
         self._proc = subprocess.Popen(
             argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=None, env=env, bufsize=0,
@@ -83,7 +128,14 @@ class StdioTransport(Transport):
             self._ready = True
         return protocol.read_frame(self._proc.stdout)
 
-    def _terminate(self) -> None:
+    def _terminate(self, kill: bool = False) -> None:
+        if kill:
+            if self._kill_argv:
+                try:
+                    subprocess.run(self._kill_argv, capture_output=True, timeout=60, check=False)
+                except (OSError, subprocess.TimeoutExpired):  # killing the client below still ends the stream
+                    pass
+            self._proc.kill()
         for stream in (self._proc.stdin, self._proc.stdout):
             try:
                 stream.close()
@@ -159,8 +211,8 @@ class Devices:
 
 
 def offer_devices(target: Target) -> Devices:
-    if target.is_network or target.gpus not in ("inherit", "none"):
-        return Devices(None, None)  # remote: its own GPUs; "share" and "device=N" are as launched
+    if target.is_network or not isinstance(target.gpus, str):
+        return Devices(None, None)  # remote: its own GPUs; a device list is as launched
     if target.gpus == "none":
         return Devices("", "")
     ticket = POOL.take()
@@ -191,4 +243,6 @@ def thread_env(cpus: float | None) -> dict[str, str]:
 
 
 def launch(target: Target, pinned_image: str | None) -> Transport:
-    return target.launcher_impl.start(target, pinned_image or target.image)
+    transport = target.launcher_impl.start(target, pinned_image or target.image)
+    transport.call_timeout = target.call_timeout
+    return transport

@@ -33,7 +33,7 @@ def _quiet():
 
 
 def env_target(env: str):
-    from evedesign.remote import Target
+    from evedesign.remote.config import Target
 
     return Target(name=f"env:{Path(env).name}", launcher="command",
                   command=(f"{env}/bin/python", "-m", "evedesign.remote.worker"))
@@ -69,6 +69,6 @@ def infra(tmp_path):
     mount = os.environ.get("EVEDESIGN_TEST_MOUNT_SRC") == "1"
     extra = f'mounts = ["{SRC}:/opt/src:ro"]\nenv = {{ PYTHONPATH = "/opt/src" }}\n' if mount else ""
     path = tmp_path / "infra.toml"
-    path.write_text("[defaults]\nlauncher = 'docker'\n" + "".join(
+    path.write_text("".join(
         f"[targets.{name}]\nimage = '{image}:latest'\n{extra}" for name, image in zip(("iso", "mw"), IMAGES)))
     return Infra.load(path)

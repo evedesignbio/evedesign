@@ -19,6 +19,7 @@ import functools
 import json
 import os
 import subprocess
+import uuid
 from typing import Any, Mapping
 
 from . import transport
@@ -42,10 +43,9 @@ class Launcher:
     def validate(self, target: Target) -> None:
         if self.needs_image and not target.image:
             raise ValueError(f"target {target.name!r}: launcher {self.name!r} needs an image")
-
-    def image_for(self, model: str, sif_dir) -> str:
-        """The image a convention name `<launcher>:<model>` means."""
-        return model if ":" in model or "@" in model else f"{model}:latest"
+        if target.command:
+            raise ValueError(f"target {target.name!r}: `command` is only for the command launcher; "
+                             f"{self.name!r} starts the worker itself")
 
     def pin(self, target: Target) -> dict[str, Any]:
         """Provenance fields, resolved before launch; `pinned_image` is what start() gets."""
@@ -55,10 +55,9 @@ class Launcher:
         raise NotImplementedError
 
 
-def _worker_command(target: Target) -> list[str]:
-    # images built from the template have the worker as entrypoint (`serve`);
-    # other images name the whole command
-    return list(target.command)
+# How every container launcher starts the worker: by name, with the image's python
+# (first on PATH), never through the image's entrypoint.
+WORKER = ("python", "-m", "evedesign.remote.worker")
 
 
 # ---------------------------------------------------------------------------
@@ -67,16 +66,16 @@ def _worker_command(target: Target) -> list[str]:
 
 def gpu_flags(target: Target) -> list[str]:
     """Docker/podman --gpus: which devices the container can see at all."""
-    if target.gpus in ("inherit", "share"):
-        devices = POOL.devices()
-        return ["--gpus", f'"device={",".join(devices)}"'] if devices else []
-    return [] if target.gpus == "none" else ["--gpus", target.gpus]
+    if target.gpus == "none":
+        return []
+    devices = POOL.devices() if target.gpus == "auto" else list(target.gpus)
+    return ["--gpus", f'"device={",".join(devices)}"'] if devices else []
 
 
-def container_argv(target: Target, image: str) -> list[str]:
+def container_argv(target: Target, image: str, name: str | None = None) -> list[str]:
     argv = [
         target.launcher, "run", "-i", "--rm", "--init",
-        "--label", "evedesign-session",
+        "--label", "evedesign-session", *(["--name", name] if name else []),
         "--user", f"{os.getuid()}:{os.getgid()}",
         # a worker needs no privileges: no capabilities, no setuid escalation
         "--cap-drop", "ALL", "--security-opt", "no-new-privileges",
@@ -98,7 +97,8 @@ def container_argv(target: Target, image: str) -> list[str]:
         dest, _, mode = rest.partition(":")
         spec = f"type=bind,source={os.path.abspath(source)},target={dest}"
         argv += ["--mount", spec + (",readonly" if mode == "ro" else "")]
-    return argv + gpu_flags(target) + [image, *_worker_command(target)]
+    entrypoint, *args = WORKER
+    return argv + gpu_flags(target) + ["--entrypoint", entrypoint, image, *args]
 
 
 class Docker(Launcher):
@@ -124,7 +124,9 @@ class Docker(Launcher):
 
     def start(self, target: Target, image: str | None) -> Transport:
         env = {**os.environ, **dict(target.env)}
-        return StdioTransport(container_argv(target, image), f"{target.launcher} {image}", env=env)
+        name = f"evedesign-{uuid.uuid4().hex[:12]}"  # so a timeout can stop the container itself
+        return StdioTransport(container_argv(target, image, name), f"{target.launcher} {image}", env=env,
+                              kill_argv=[target.launcher, "kill", name])
 
 
 class Podman(Docker):
@@ -134,24 +136,23 @@ class Podman(Docker):
 class Apptainer(Launcher):
     name = "apptainer"
 
-    def image_for(self, model: str, sif_dir) -> str:
-        return str(sif_dir / f"{model}.sif")
-
     def pin(self, target: Target) -> dict[str, Any]:
         from .provenance import file_sha256
 
         return {"sha256": file_sha256(target.image), "pinned_image": target.image}
 
     def start(self, target: Target, image: str | None) -> Transport:
-        argv = ["apptainer", "run", "--containall"]
+        argv = ["apptainer", "exec", "--containall"]
         if target.gpus != "none" and transport._has_nvidia():
             argv.append("--nv")
         for mount in target.mounts:
             argv += ["--bind", mount]
         # APPTAINERENV_KEY sets KEY inside the container; values stay out of argv
         values = {"UV_NO_SYNC": "1", **thread_env(target.cpus), **dict(target.env)}
+        if not isinstance(target.gpus, str):
+            values["CUDA_VISIBLE_DEVICES"] = ",".join(target.gpus)
         env = {**os.environ, **{f"APPTAINERENV_{k}": v for k, v in values.items()}}
-        return StdioTransport(argv + [image, *_worker_command(target)], f"apptainer {image}", env=env)
+        return StdioTransport(argv + [image, *WORKER], f"apptainer {image}", env=env)
 
 
 class Command(Launcher):
@@ -172,7 +173,7 @@ class Command(Launcher):
         return bool(target.options.get("network"))
 
     def validate(self, target: Target) -> None:
-        if not target.command or target.command == ("serve",):
+        if not target.command:
             raise ValueError(f"target {target.name!r}: launcher 'command' needs a command")
         if target.mounts:
             raise ValueError(f"target {target.name!r}: launcher 'command' has no mounts; use the paths directly")
@@ -182,6 +183,10 @@ class Command(Launcher):
 
     def start(self, target: Target, image: str | None) -> Transport:
         env = {**os.environ, **thread_env(target.cpus), **dict(target.env)}
+        if not isinstance(target.gpus, str):
+            env["CUDA_VISIBLE_DEVICES"] = ",".join(target.gpus)
+        elif target.gpus == "none":
+            env["CUDA_VISIBLE_DEVICES"] = ""
         return StdioTransport(list(target.command), f"command {target.name}", env=env)
 
 

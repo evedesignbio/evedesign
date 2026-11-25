@@ -3,13 +3,14 @@ Isolated and remote execution of evedesign models: each model in its own
 environment (container, Apptainer image, Modal sandbox), used through a local
 proxy that behaves like the model.
 
-    open_model(target, model, **args)              == the constructor; build() is forwarded
-    open_built(target, model, system, data, **args) == construct + build there, nested models included
-    session(infra, seed)                           owns models, builds them concurrently
+    open_model(target, model)                  created there, unbuilt; build() is forwarded
+    open_built(target, model, system, data)    created and built there, nested models included
+    reload_model(target, blob)                 a stored model, loaded there
+    session(infra, seed)                       owns models, starts and builds them in parallel
 
     with session("infra.toml", seed=1234) as s:
-        esm = s.open_model("esm2-gpu", "esm2", device="cuda")
-        mw = s.open_model("docker:molweight")
+        esm, mw = s.open_all([("esm2-gpu", {"key": "esm2", "args": {"device": "cuda"}}),
+                              ("docker:molweight:latest", None)])
         s.build_all(system)
         designs = GibbsSampler(scorers=[esm, mw], weights=[1, .5]).generate(16)
 
@@ -23,13 +24,13 @@ from typing import TYPE_CHECKING, Any
 
 _EXPORTS = {
     "Session": "api", "open_model": "api", "open_built": "api", "reload_model": "api", "session": "api",
-    "Infra": "config", "Target": "config",
+    "Infra": "config",
 }
-__all__ = ["Infra", "Session", "Target", "open_built", "open_model", "reload_model", "session"]
+__all__ = ["Infra", "Session", "open_built", "open_model", "reload_model", "session"]
 
 if TYPE_CHECKING:
     from .api import Session, open_built, open_model, reload_model, session
-    from .config import Infra, Target
+    from .config import Infra
 
 
 def __getattr__(name: str) -> Any:

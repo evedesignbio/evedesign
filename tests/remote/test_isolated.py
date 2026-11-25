@@ -13,7 +13,7 @@ import pytest
 from evedesign.remote import open_model, session
 
 from . import fake_modal
-from .conftest import ENVS, MW, P, PI, SRC
+from .conftest import ENVS, MW, PI, SRC
 
 pytestmark = pytest.mark.remote
 
@@ -52,20 +52,22 @@ def test_modal_sandbox(monkeypatch, system):
     module, calls = fake_modal.make(python=f"{ENVS[1]}/bin/python", pythonpath=SRC)
     monkeypatch.setitem(sys.modules, "modal", module)
     infra = {"targets": {"mw-modal": {
-        "launcher": "modal", "image": "ghcr.io/org/molweight@sha256:abc", "gpu": "L40S",
+        "launcher": "modal", "image": "ghcr.io/org/molweight@sha256:abc", "gpu_type": "L40S",
         "registry_secret": "ghcr-pull", "secrets": ["huggingface"], "env": {"LOG_LEVEL": "x"},
         "volumes": {"/models": "esm2-weights"}, "cpus": 4}}}
 
     pi, _ = _local_scorers(system)
     local = _gibbs(_local_scorers(system))
     with session(infra, seed=3) as s:
-        mw = s.open_model("mw-modal", P + "MolecularWeightRestraint", lower_bound=2000, upper_bound=2600)
+        mw = s.open_model("mw-modal", MW)
         mw.build(system)
         assert _gibbs([pi, mw]) == local                    # chunked stream reassembled exactly
         assert mw.provenance["launcher"]["pinned_by_digest"] is True
         assert mw.provenance["launcher"]["volumes"] == {"/models": "esm2-weights"}   # outside the image
         sandbox = calls["sandboxes"][0]
 
+    # the main process outlives the session, whatever the image's CMD and ENTRYPOINT
+    assert sandbox.command == ("sleep", "infinity") and sandbox.kwargs["image"].entrypoint is None
     kwargs = sandbox.kwargs
     assert kwargs["image"].ref == "ghcr.io/org/molweight@sha256:abc"
     assert kwargs["image"].secret.value == "ghcr-pull"      # private registry credentials
@@ -93,7 +95,7 @@ def test_containers_resolve_cards_and_record_provenance(infra, system, tmp_path)
     assert _numpy(iso_rec) != _numpy(mw_rec)
 
     # a card does not claim other keys
-    with pytest.raises(RemoteError, match="no 'class' given"):
+    with pytest.raises(RemoteError, match="card is for 'isoelectric'"):
         open_model("iso", {"key": "esm2"}, infra=infra)
 
     # locks pin by content and refuse what they do not list
@@ -103,6 +105,10 @@ def test_containers_resolve_cards_and_record_provenance(infra, system, tmp_path)
     assert locked.resolve("iso").image == pinned
     with pytest.raises(LookupError, match="not in the lock"):
         locked.resolve("mw")
+
+    # the worker is started by name, whatever the image's entrypoint does (here: exit 3)
+    with open_model("docker:evedesign-test-molweight:latest", MW) as m:
+        assert m.provenance["launcher"]["target"] == "docker:evedesign-test-molweight:latest"
 
 
 SSH = """#!/bin/sh

@@ -13,7 +13,7 @@ from typing import Any
 
 from . import protocol
 from .config import Target
-from .launchers import Launcher
+from .launchers import WORKER, Launcher
 from .transport import Transport, thread_env
 
 # The Sandbox's main process. It must outlive the session: run as is, the image's own
@@ -26,7 +26,7 @@ IDLE_ENTRYPOINT = ("sleep", "infinity")
 class Modal(Launcher):
     name = "modal"
     options = {
-        "gpu": None,                 # e.g. "L40S", "H100"
+        "gpu_type": None,            # e.g. "L40S", "H100", "A100:2"
         "timeout": 24 * 3600,        # upper bound on a session's lifetime (s)
         "app": "evedesign-remote",
         # Modal secret for a private image: REGISTRY_USERNAME / REGISTRY_PASSWORD, or for
@@ -43,9 +43,8 @@ class Modal(Launcher):
         super().validate(target)
         if target.mounts:
             raise ValueError(f"target {target.name!r}: Modal cannot bind host folders; use volumes")
-
-    def image_for(self, model: str, sif_dir) -> str:
-        return model
+        if not isinstance(target.gpus, str):
+            raise ValueError(f"target {target.name!r}: Modal has no local devices; choose GPUs with gpu_type")
 
     def pin(self, target: Target) -> dict[str, Any]:
         # a registry digest pins exactly; a tag is recorded as given and flagged
@@ -91,14 +90,12 @@ class ModalTransport(Transport):
         self._sandbox = modal.Sandbox.create(
             *IDLE_ENTRYPOINT,
             app=app, image=registry_image(modal, image, options["registry_secret"]),
-            gpu=options["gpu"], cpu=target.cpus, timeout=options["timeout"], secrets=secrets,
+            gpu=None if target.gpus == "none" else options["gpu_type"], cpu=target.cpus, timeout=options["timeout"], secrets=secrets,
             volumes={path: modal.Volume.from_name(name) for path, name in options["volumes"].items()},
         )
         # The worker runs as an exec'd process, started by name: the image puts its
-        # environment's python first on PATH. Set `command` on the target if the image's
-        # python is elsewhere.
-        command = list(target.command) if target.command != ("serve",) else ["python", "-m", "evedesign.remote.worker"]
-        self._proc = self._sandbox.exec(*command, text=False)
+        # environment's python first on PATH.
+        self._proc = self._sandbox.exec(*WORKER, text=False)
         self._chunks = iter(self._proc.stdout)
         self._buffer = protocol.FrameBuffer(self.description)
         self._pending: list[dict[str, Any]] = []
@@ -124,5 +121,5 @@ class ModalTransport(Transport):
             self._pending.extend(self._buffer.feed(chunk))
         return self._pending.pop(0)
 
-    def _terminate(self) -> None:
+    def _terminate(self, kill: bool = False) -> None:
         self._sandbox.terminate()

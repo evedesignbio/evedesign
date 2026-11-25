@@ -5,7 +5,8 @@ The two sides run in environments that differ on purpose, so numpy, pandas and
 torch versions differ too and pickle is not an option. Everything crosses as
 msgpack, with extension types for the few library objects that need them:
 
-    System, SystemInstance   via the library's own serialize()/deserialize()
+    System, SystemInstance,  via the library's own serialize()/deserialize()
+    LabeledInstanceDataset
     pandas.DataFrame/Series  index levels, column labels and one column at a time
                              (numeric/bool as arrays, strings and objects as lists),
                              rebuilt natively on the far side; other dtypes are refused
@@ -16,12 +17,13 @@ Anything else that msgpack cannot encode raises CodecError naming the type,
 rather than being pickled quietly.
 """
 
+import sys
 from typing import Any
 
 import msgpack
 import numpy as np
 
-_SYSTEM, _INSTANCE, _FRAME, _SERIES, _ARRAY, _TUPLE = 1, 2, 3, 4, 5, 6
+_SYSTEM, _INSTANCE, _FRAME, _SERIES, _ARRAY, _TUPLE, _DATASET = 1, 2, 3, 4, 5, 6, 7
 
 
 class CodecError(TypeError):
@@ -68,6 +70,10 @@ def _frame_from_bytes(data: bytes):
 def _default(obj: Any) -> Any:
     from evedesign.system import System, SystemInstance
 
+    # not imported (it pulls in sklearn) unless a dataset can exist in this process
+    dataset = sys.modules.get("evedesign.dataset")
+    if dataset is not None and isinstance(obj, dataset.LabeledInstanceDataset):
+        return msgpack.ExtType(_DATASET, dumps(obj.serialize()))
     if isinstance(obj, System):
         return msgpack.ExtType(_SYSTEM, dumps(obj.serialize()))
     if isinstance(obj, SystemInstance):
@@ -106,7 +112,7 @@ def _default(obj: Any) -> Any:
         )
     raise CodecError(
         f"cannot send a {type(obj).__module__}.{type(obj).__qualname__} across the "
-        f"process boundary; only msgpack types, System, SystemInstance, numpy arrays "
+        f"process boundary; only msgpack types, System, SystemInstance, LabeledInstanceDataset, numpy arrays "
         f"and pandas objects are supported"
     )
 
@@ -120,6 +126,10 @@ def _ext_hook(code: int, data: bytes) -> Any:
         from evedesign.system import SystemInstance
 
         return SystemInstance.deserialize(loads(data))
+    if code == _DATASET:
+        from evedesign.dataset import LabeledInstanceDataset
+
+        return LabeledInstanceDataset.deserialize(loads(data))
     if code == _ARRAY:
         dtype, shape, raw = msgpack.unpackb(data)
         return np.frombuffer(raw, dtype=np.dtype(dtype)).reshape(shape).copy()

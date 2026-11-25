@@ -95,8 +95,10 @@ class RemoteModel:
 
     def build(self, system, data: Any = None, status_callback=None, **build_args: Any):
         """Forwarded every time, exactly like a local build(); the far side builds here.
-        The spec's build_args are the defaults; keyword arguments here override them."""
-        build_args = {**((self.provenance.get("spec") or {}).get("build_args") or {}), **build_args}
+        The spec's data and build_args are the defaults; arguments here override them."""
+        spec = self.provenance.get("spec") or {}
+        data = spec.get("data") if data is None else data
+        build_args = {**(spec.get("build_args") or {}), **build_args}
         descriptor = self._call("build", system=system, data=data, build_args=build_args)
         self._apply(descriptor, system=system)
         return self

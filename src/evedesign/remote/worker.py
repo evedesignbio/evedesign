@@ -1,24 +1,20 @@
 """
-The far side of a session: one model (or one co-located tree) per process.
+The far side of a session: one model (or one tree of models) per process.
 
-Started as `python -m evedesign.remote.worker [serve]` (in images, via
-docker/entrypoint.sh `serve`). Speaks length-prefixed frames on stdin/stdout and
-exits on EOF, so a killed orchestrator never leaves it running.
+Started as `python -m evedesign.remote.worker` (images need only evedesign[remote]
+and their Python on PATH). Speaks length-prefixed frames on stdin/stdout and exits
+on EOF, so a killed orchestrator never leaves it running.
 
-Construction is resolved here, so the far side is authoritative about what a
-model key means:
+A model is resolved here, so the image is authoritative about what it holds:
 
-  1. spec["class"] = "module:Class"                 explicit
-  2. the model card in the image (README front matter: model_class,
-     hyper_parameters), if the spec's key matches the card or names none
-  3. installed resolver plugins, e.g. evedesign-server's model table
+  1. a class path: imported, with the constructor's own defaults (the card does not
+     apply, so a spec with a class path means the same in every image);
+  2. otherwise the image's model card (README front matter: model_class,
+     hyper_parameters), if it describes the model: no key given, or the card's key
+     (else its name) given exactly;
+  3. otherwise an error naming the card the image has.
 
-Plugins are entry points in the group "evedesign.remote", so this package never
-imports a package that depends on it:
-
-  resolve        (spec: dict, transform: bool) -> (class, args, record) | None
-  pipeline_tree  (spec, system, schema, stored_models, server_version)
-                     -> (instance, [(spec, obj), ...], records)
+Nested models come from the spec's `models`; `args` are passed on as given.
 """
 
 import os
@@ -30,32 +26,15 @@ from pathlib import Path
 from typing import Any
 
 from . import protocol
+from .spec import children, validate
 from .surface import PROTOCOL_VERSION, all_attribute_names, declared_surface, interfaces_of, surface_hash
 
-SPEC_FIELDS = frozenset({"key", "class", "variant", "args", "data", "id", "source_id", "rebuild_on_load",
-                         "stats", "citations", "wrap", "build_args"})
 CARD_PATH = Path("/opt/program/README.md")  # proteingym-models layout
 
 
 # ---------------------------------------------------------------------------
 # spec resolution
 # ---------------------------------------------------------------------------
-
-def is_spec(value: Any) -> bool:
-    return (
-        isinstance(value, dict)
-        and ("class" in value or isinstance(value.get("key"), str))
-        and set(value) <= SPEC_FIELDS
-    )
-
-
-def has_nested_specs(spec: dict) -> bool:
-    args = spec.get("args") or {}
-    return any(
-        is_spec(v) or (isinstance(v, list) and any(is_spec(e) for e in v))
-        for v in args.values()
-    )
-
 
 def read_card() -> tuple[dict, str] | None:
     """(front matter, sha256 of the card file) for the image's model card, if any."""
@@ -76,67 +55,41 @@ def _import(path: str) -> type:
     return getattr(import_module(module), name)
 
 
-def resolve(spec: dict, *, transform: bool = True) -> tuple[type, dict, dict]:
-    """_resolve, then the spec's wrap factories (see wrapping.py)."""
-    cls, args, record = _resolve(spec, transform=transform)
+def card_describes(meta: dict, spec: dict) -> bool:
+    """Whether the card is for the model a spec without a class path names: no key, or the
+    card's key (else its name), exactly."""
+    held = meta.get("key", meta.get("name"))
+    return "model_class" in meta and spec.get("key", held) == held
+
+
+def resolve(spec: dict) -> tuple[type, dict, dict]:
+    """
+    (class, constructor args without nested models, record for provenance).
+    The card's hyper_parameters are the defaults when it describes the model (never
+    for a class path); the spec's args override them. Then the spec's wrap factories are applied.
+    """
+    args = dict(spec.get("args") or {})
+    card = None if "class" in spec else read_card()
+    if "class" in spec:
+        cls, record = _import(spec["class"]), {"via": "class", "class": spec["class"]}
+    elif card is not None and card_describes(card[0], spec):
+        meta, card_hash = card
+        cls, record = _import(meta["model_class"]), {
+            "via": "model_card", "class": meta["model_class"], "card_sha256": card_hash}
+        args = {**(meta.get("hyper_parameters") or {}), **args}
+    else:
+        name = spec.get("key")
+        held = card[0].get("key", card[0].get("name")) if card else None
+        raise LookupError(
+            f"cannot resolve model {name!r}: "
+            + (f"the image's model card is for {held!r}" if card else "the image has no model card")
+            + "; name the model by its class path, or by the card's key"
+        )
     if spec.get("wrap"):
         from .wrapping import apply_wraps, normalize
 
         cls, record = apply_wraps(cls, spec["wrap"]), {**record, "wrap": normalize(spec["wrap"])}
     return cls, args, record
-
-
-def _resolve(spec: dict, *, transform: bool = True) -> tuple[type, dict, dict]:
-    """
-    (class, constructor args without nested specs, resolution record for provenance).
-
-    The card resolves a spec that names no key, or whose key the card claims
-    (its `key`, `name` or class name). Other keys go to the model table; that
-    way a placed sampler in a tree, or a key the image does not hold, cannot be
-    silently constructed as the image's own model.
-    """
-    args = dict(spec.get("args") or {})
-
-    if "class" in spec:
-        return _import(spec["class"]), args, {"via": "class", "class": spec["class"]}
-
-    card = read_card()
-    if card is not None and "model_class" in card[0]:
-        meta, card_hash = card
-        if _card_claims(meta, spec.get("key")):
-            merged = {**(meta.get("hyper_parameters") or {}), **args}
-            return _import(meta["model_class"]), merged, {
-                "via": "model_card", "class": meta["model_class"], "card_sha256": card_hash,
-            }
-
-    for plugin in _plugins("resolve"):
-        resolved = plugin(spec, transform)
-        if resolved is not None:
-            return resolved
-
-    card_name = card[0].get("key", card[0].get("name")) if card else None
-    raise LookupError(
-        f"cannot resolve model {spec.get('key')!r}: no 'class' given, "
-        + (f"the image's model card is for {card_name!r} (add `key: {spec.get('key')}` to the "
-           f"card if it is the same model), " if card else "there is no model card, ")
-        + "and no installed resolver knows it (evedesign-server provides the model table)"
-    )
-
-
-def _plugins(name: str) -> list:
-    from importlib.metadata import entry_points
-
-    return [ep.load() for ep in entry_points(group="evedesign.remote", name=name)]
-
-
-def _card_claims(meta: dict, key: str | None) -> bool:
-    """A card claims a key equal to its `key`, its `name`, or its class name (case-insensitive)."""
-    if key is None:
-        return True
-    if "key" in meta:
-        return meta["key"] == key
-    norm = lambda s: str(s).lower().replace("-", "").replace("_", "")  # noqa: E731
-    return norm(key) in {norm(meta.get("name", "")), norm(meta["model_class"].rpartition(":")[2])}
 
 
 def seed_everything(seed: int | None) -> None:
@@ -156,25 +109,40 @@ def seed_everything(seed: int | None) -> None:
 
 def instantiate_tree(spec: dict, system, data: Any, collection: list, records: list) -> Any:
     """
-    Core equivalent of evedesign_server's instantiate_class, minus the repository:
-    children are instantiated (and built) first, then the parent is constructed
-    with them and built if it is a BaseModel. `collection` gets (spec, object) in
-    the same order instantiate_class appends them: children before parent.
+    Create (or load) and build the model spec names, its nested models first.
+    `collection` gets (spec, object) and `records` one record per model, both in
+    build order: children first, in `models` order, the parent last.
     """
     from evedesign.model import BaseModel
 
-    cls, args, record = resolve(spec)
-    for name, value in list(args.items()):
-        if is_spec(value):
-            args[name] = instantiate_tree(value, system, value.get("data"), collection, records)
-        elif isinstance(value, list) and value and is_spec(value[0]):
-            args[name] = [instantiate_tree(v, system, v.get("data"), collection, records) for v in value]
+    build_args = spec.get("build_args") or {}
+    if "serialized" in spec:
+        import dill
 
-    obj = cls(**args)
-    if isinstance(obj, BaseModel):
-        obj.build(system=system, data=data, **(spec.get("build_args") or {}))
+        obj = dill.loads(spec["serialized"])
+        if spec.get("rebuild"):
+            obj.build(system=system, data=data, **build_args)
+        elif system is not None and isinstance(obj, BaseModel) and obj.system != system:
+            raise ValueError("the system of the loaded model does not agree with the given system")
+        record = {"via": "serialized", "class": f"{type(obj).__module__}:{type(obj).__qualname__}",
+                  "loaded": True, "rebuilt": bool(spec.get("rebuild"))}
+    else:
+        cls, args, record = resolve(spec)
+        printable = _printable(args)
+        for name, value in (spec.get("models") or {}).items():
+            if isinstance(value, list):
+                args[name] = [instantiate_tree(v, system, v.get("data"), collection, records) for v in value]
+            else:
+                args[name] = instantiate_tree(value, system, value.get("data"), collection, records)
+        obj = cls(**args)
+        if isinstance(obj, BaseModel):
+            obj.build(system=system, data=data, **build_args)
+        record = {**record, "args": printable, "loaded": False, "rebuilt": False}
+
+    record["citations"] = getattr(obj, "citations", None)
+    record["stats"] = obj.stats() if isinstance(obj, BaseModel) and obj.ready else None
     collection.append((spec, obj))
-    records.append({**record, "key": spec.get("key"), "args": _printable(args)})
+    records.append(record)
     return obj
 
 
@@ -217,51 +185,26 @@ class Session:
             os.environ["CUDA_VISIBLE_DEVICES"] = self.cuda_visible
 
     def op_open_model(self, spec: dict, devices: dict | None = None) -> dict:
-        if has_nested_specs(spec):
-            raise ValueError("spec has nested model specs; use open_built")
+        validate(spec)
+        if spec.get("models"):
+            raise ValueError("a spec with nested models is opened with open_built")
+        if "serialized" in spec:
+            raise ValueError("a stored model is opened with open_built or reload_model")
         cls, args, record = resolve(spec)
         self._devices(devices, _uses_gpu(cls))
         self.instance = cls(**args)
-        self.records = [{**record, "key": spec.get("key"), "args": _printable(args)}]
+        self.records = [{**record, "args": _printable(args), "loaded": False, "rebuilt": False}]
         self.collection = [(spec, self.instance)]
         return self.describe()
 
-    def op_open_built(self, spec: dict, system, data: Any = None, schema: str | None = None,
-                      devices: dict | None = None, stored_models: dict | None = None,
-                      server_version: str | None = None, uses_gpu: bool | None = None) -> dict:
-        if schema is not None and uses_gpu is None:
-            # a pipeline tree is only interpreted by the pipeline's own validated code, never
-            # walked here as raw dicts: its specs may carry user data that looks like specs
-            raise ValueError("a pipeline tree needs uses_gpu from the orchestrator")
-        self._devices(devices, _tree_uses_gpu(spec) if uses_gpu is None else uses_gpu)
+    def op_open_built(self, spec: dict, system=None, data: Any = None, devices: dict | None = None) -> dict:
+        validate(spec)
+        if system is None and not ("serialized" in spec and not spec.get("rebuild")):
+            raise ValueError("open_built needs a system, unless it loads a stored model without rebuilding it")
+        self._devices(devices, _tree_uses_gpu(spec))
         self.collection, self.records = [], []
-        if schema is not None:
-            self._open_pipeline_tree(spec, system, schema, stored_models or {}, server_version)
-        else:
-            root_data = data if data is not None else spec.get("data")
-            self.instance = instantiate_tree(spec, system, root_data, self.collection, self.records)
-        return self.describe()
-
-    def _open_pipeline_tree(self, spec: dict, system, schema: str, stored_models: dict,
-                            server_version: str | None) -> None:
-        """A pipeline spec tree, instantiated by the pipeline's own code (a plugin)."""
-        plugins = _plugins("pipeline_tree")
-        if not plugins:
-            raise RuntimeError(
-                "placing a pipeline spec with nested models needs evedesign-server in the image "
-                "(it runs the server's own instantiate_class). Use an image that has it, or place "
-                "the nested models individually and keep the parent local."
-            )
-        self.instance, self.collection, self.records = plugins[0](
-            spec, system, schema, stored_models, server_version)
-
-    def op_reload(self, blob: bytes, devices: dict | None = None) -> dict:
-        self._devices(devices, True)  # unknown until loaded, and loading may already place tensors
-        import dill
-
-        self.instance = dill.loads(blob)
-        self.collection = [({}, self.instance)]
-        self.records = [{"via": "reload", "class": f"{type(self.instance).__module__}:{type(self.instance).__qualname__}"}]
+        root_data = data if data is not None else spec.get("data")
+        self.instance = instantiate_tree(spec, system, root_data, self.collection, self.records)
         return self.describe()
 
     def op_build(self, system, data: Any = None, build_args: dict | None = None) -> dict:
@@ -317,13 +260,11 @@ def _uses_gpu(cls) -> bool:
 
 
 def _tree_uses_gpu(spec: dict) -> bool:
-    """Whether any model of a tree may use a GPU. Pipeline keys a plugin cannot resolve: assume so."""
-    try:
-        cls, args, _ = resolve(spec, transform=False)  # transforms expect the pipeline's objects
-    except LookupError:
+    """Whether any model of a tree may use a GPU; a stored model's class is unknown until loaded."""
+    if "serialized" in spec:
         return True
-    nested = [v for value in args.values() for v in (value if isinstance(value, list) else [value])]
-    return _uses_gpu(cls) or any(_tree_uses_gpu(n) for n in nested if is_spec(n))
+    cls, _, _ = resolve(spec)
+    return _uses_gpu(cls) or any(_tree_uses_gpu(child) for child in children(spec))
 
 
 def _error(message: dict, exc: BaseException) -> dict:
@@ -374,7 +315,7 @@ def serve(stdin=None, stdout=None) -> None:
 
 def main(argv: list[str] | None = None) -> None:
     argv = sys.argv[1:] if argv is None else argv
-    if argv and argv[0] not in ("serve",):
+    if argv and argv[0] != "serve":  # `serve` is accepted for images whose entrypoint passes it
         raise SystemExit(f"usage: python -m evedesign.remote.worker [serve]  (got {argv})")
     serve()
 

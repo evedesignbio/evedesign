@@ -26,8 +26,12 @@ def make(python: str, pythonpath: str):
             return cls("dict", dict(values))
 
     class Image:
-        def __init__(self, ref, secret, source="registry"):
-            self.ref, self.secret, self.source = ref, secret, source
+        def __init__(self, ref, secret, source="registry", entrypoint="image's"):
+            self.ref, self.secret, self.source, self.entrypoint = ref, secret, source, entrypoint
+
+        def dockerfile_commands(self, commands):
+            assert commands == ["ENTRYPOINT []"], commands
+            return Image(self.ref, self.secret, self.source, entrypoint=None)
 
         @classmethod
         def from_registry(cls, ref, secret=None):
@@ -79,14 +83,19 @@ def make(python: str, pythonpath: str):
             self.stderr = _Reader(proc.stderr, (4096,))
 
     class Sandbox:
-        def __init__(self, **kwargs):
-            self.kwargs = kwargs
+        def __init__(self, *command, **kwargs):
+            # the command replaces the image's CMD only. Unless it runs on its own (no
+            # ENTRYPOINT), the main process here exits at once, like a worker reading no
+            # stdin or an entrypoint that ignores its arguments, and ends the Sandbox with
+            # everything exec'd into it
+            self.command, self.kwargs = command, kwargs
+            self.main_exited = not (command and kwargs["image"].entrypoint is None)
             self.procs = []
             self.terminated = False
 
         @classmethod
-        def create(cls, **kwargs):
-            sandbox = cls(**kwargs)
+        def create(cls, *command, **kwargs):
+            sandbox = cls(*command, **kwargs)
             calls["sandboxes"].append(sandbox)
             return sandbox
 
@@ -100,6 +109,8 @@ def make(python: str, pythonpath: str):
             proc = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                     stderr=subprocess.PIPE, env=env, bufsize=0)
             self.procs.append(proc)
+            if self.main_exited:
+                proc.kill()  # the Sandbox has already ended
             return _Process(proc)
 
         def terminate(self, wait=False):
