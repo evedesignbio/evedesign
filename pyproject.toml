@@ -4,7 +4,7 @@ build-backend = "uv_build"
 
 [project]
 name = "evedesign"
-version = "0.0.8"
+version = "0.0.9"
 description = ''
 readme = "README.md"
 requires-python = ">=3.12"
@@ -45,9 +45,13 @@ gpytorch = ["torch", "gpytorch"]
 notebooks = ["py3Dmol"]
 # evedesign.proteingym (dataset conversion) and the evedesign-proteingym runner
 proteingym = ["proteingym-base>=0.2,<0.3", "polars", "typer", "rich", "dill"]
+# evedesign.remote: models in isolated environments / on remote hosts, behind local proxies
+remote = ["msgpack>=1.0", "pyyaml", "dill"]
+modal = ["evedesign[remote]", "modal"]
 
 [project.scripts]
 evedesign-proteingym = "evedesign.proteingym:app"
+evedesign-remote = "evedesign.remote.cli:main"
 
 [project.urls]
 Documentation = "https://github.com/evedesignbio/evedesign#readme"
@@ -71,6 +75,7 @@ markers = [
     "esm2: tests requiring the esm2 extra (torch, transformers)",
     "evcouplings: tests requiring the evcouplings extra",
     "mpnn: tests requiring the mpnn extra (torch, prody)",
+    "remote: tests starting model workers in other environments (EVEDESIGN_TEST_ENVS) or containers",
 ]
 
 [tool.coverage.run]

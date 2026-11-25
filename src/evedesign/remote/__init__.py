@@ -1,0 +1,40 @@
+"""
+Isolated and remote execution of evedesign models: each model in its own
+environment (container, Apptainer image, Modal sandbox), used through a local
+proxy that behaves like the model.
+
+    open_model(target, model, **args)              == the constructor; build() is forwarded
+    open_built(target, model, system, data, **args) == construct + build there, nested models included
+    session(infra, seed)                           owns models, builds them concurrently
+
+    with session("infra.toml", seed=1234) as s:
+        esm = s.open_model("esm2-gpu", "esm2", device="cuda")
+        mw = s.open_model("docker:molweight")
+        s.build_all(system)
+        designs = GibbsSampler(scorers=[esm, mw], weights=[1, .5]).generate(16)
+
+Needs the `remote` extra (msgpack, pyyaml, dill); Modal targets also `modal`.
+Names are imported on first use, so submodules without those dependencies
+(e.g. evedesign.remote.wrapping) work without the extra.
+"""
+
+from importlib import import_module
+from typing import TYPE_CHECKING, Any
+
+_EXPORTS = {
+    "Session": "api", "open_model": "api", "open_built": "api", "reload_model": "api", "session": "api",
+    "Infra": "config", "Target": "config",
+}
+__all__ = ["Infra", "Session", "Target", "open_built", "open_model", "reload_model", "session"]
+
+if TYPE_CHECKING:
+    from .api import Session, open_built, open_model, reload_model, session
+    from .config import Infra, Target
+
+
+def __getattr__(name: str) -> Any:
+    if name in _EXPORTS:
+        value = getattr(import_module(f".{_EXPORTS[name]}", __name__), name)
+        globals()[name] = value
+        return value
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

@@ -11,6 +11,7 @@ from loguru import logger
 from evedesign.constants import GAP
 from evedesign.model import Generator, ConditionalMutationScorer, Scorer
 from evedesign.system import System, Entity, SystemInstance, EntityInstance, BiopolymerEntity
+from evedesign.utils import score_all
 from evedesign.types import StatusCallback, CHAIN_COMPONENT_KEY, SCORE_COMPONENT_KEY, EntityPosList
 from evedesign.utils import status_progress, ensure_sequence, map_array
 
@@ -664,17 +665,17 @@ class GibbsSampler(Generator):
                 step_pos = order[_POS][:, step]
                 assert len(step_ent) == len(step_pos) == num_designs
 
-                # apply all scorers to current instances and compute weighted sum of scores;
-                # we could decouple GPU and CPU-based computations here with multiprocessing
-                # eventually to increase speed
+                # apply all scorers to current instances (concurrently, so scorers in other
+                # processes cost the slowest rather than the sum) and compute weighted sum
                 agg_scores = None
-                for scorer_idx, (scorer, weight) in enumerate(
-                    zip(self.scorers, self.weights)
+                raw_scores = score_all(
+                    self.scorers, "score_conditional", instances, step_ent, step_pos
+                )
+                for scorer_idx, (raw, weight) in enumerate(
+                    zip(raw_scores, self.weights)
                 ):
                     # compute weighted score
-                    s = scorer.score_conditional(
-                        instances, step_ent, step_pos
-                    ) * weight
+                    s = raw * weight
 
                     s = self._verify_and_update_scores(
                         s, scorer_idx=scorer_idx, alphabet=alphabet, num_designs=num_designs,
