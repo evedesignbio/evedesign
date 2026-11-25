@@ -51,7 +51,8 @@ def read_card() -> tuple[dict, str] | None:
 
 
 def _import(path: str) -> type:
-    module, _, name = path.partition(":")
+    """"package.module:Class", or "package.module.Class" as model cards may also write it."""
+    module, _, name = path.partition(":") if ":" in path else path.rpartition(".")
     return getattr(import_module(module), name)
 
 
