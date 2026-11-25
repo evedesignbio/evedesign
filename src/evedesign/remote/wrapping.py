@@ -4,7 +4,9 @@ in list order, first entry innermost. An entry is "module:factory" or
 {"factory": "module:factory", "args": {...}}. Wrap args configure the wrapper
 and must not depend on the system; those go in the spec's build_args.
 
-A factory is an import and a call: where specs come from users, pass `allowed`,
+Wrapped classes point to the class they wrap through `__wrapped__` (set here if
+the factory does not), so class-level questions such as GPU use can be answered
+from it. A factory is an import and a call: where specs come from users, pass `allowed`,
 which is checked before anything is imported.
 """
 
@@ -52,6 +54,8 @@ def _wrap(cls: type, factory_path: str, args_json: str) -> type:
         raise TypeError(f"wrap factory {factory_path}: {exc}") from None
     wrapped = factory(cls, **args)
     if wrapped is not cls:
+        if "__wrapped__" not in vars(wrapped):
+            wrapped.__wrapped__ = cls  # for class-level questions, e.g. GPU use
         # how this class was made, for as_spec(cls); from __dict__ since subclasses inherit it
         inner = vars(cls).get("_evedesign_wrap")
         wrapped._evedesign_wrap = {

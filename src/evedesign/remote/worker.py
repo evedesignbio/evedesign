@@ -309,9 +309,9 @@ class Session:
 
 def _uses_gpu(cls) -> bool:
     """From the class's declarations; not a plain bool (e.g. a property): assume it may."""
-    wrapped = getattr(cls, "_evedesign_wrap", None)
-    if wrapped is not None:  # wrappers delegate (as properties): the base class declares it
-        cls = _import(wrapped["base"])
+    # wrappers (e.g. system_subset_model) delegate through properties: ask the wrapped class
+    while "__wrapped__" in vars(cls):  # own attribute only: a subclass of a wrapper is not one
+        cls = cls.__wrapped__
     declared = [getattr(cls, a, False) for a in ("requires_gpu", "supports_gpu")]
     return any(d is True or not isinstance(d, bool) for d in declared)
 

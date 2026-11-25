@@ -16,6 +16,12 @@ from .config import Target
 from .launchers import Launcher
 from .transport import Transport, thread_env
 
+# The Sandbox's main process. It must outlive the session: run as is, the image's own
+# command may exit at once (a worker reading no stdin, a shell, --help), ending the
+# Sandbox and the worker exec'd into it before any work is done. It blocks without
+# consuming anything; coreutils is present in the Debian-based images Modal supports.
+IDLE_ENTRYPOINT = ("sleep", "infinity")
+
 
 class Modal(Launcher):
     name = "modal"
@@ -61,8 +67,13 @@ def registry_image(modal, image: str, secret_name: str | None):
         if secret is None:
             raise ValueError(f"{image}: a private ECR image needs registry_secret, a Modal secret with "
                              f"AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY and AWS_REGION")
-        return modal.Image.from_aws_ecr(image, secret=secret)
-    return modal.Image.from_registry(image, secret=secret)
+        built = modal.Image.from_aws_ecr(image, secret=secret)
+    else:
+        built = modal.Image.from_registry(image, secret=secret)
+    # A Sandbox's command replaces only the image's CMD: without an ENTRYPOINT the idle
+    # command runs as is, whatever entrypoint the image has (e.g. one that does not exec
+    # its arguments). The worker is exec'd by name, never through the entrypoint.
+    return built.dockerfile_commands(["ENTRYPOINT []"])
 
 
 class ModalTransport(Transport):
@@ -77,16 +88,15 @@ class ModalTransport(Transport):
             secrets.append(modal.Secret.from_dict(dict(target.env)))
         if target.cpus is not None:
             secrets.append(modal.Secret.from_dict(thread_env(target.cpus)))
-        IDLE_ENTRYPOINT = ("sleep", "infinity")
         self._sandbox = modal.Sandbox.create(
-            *IDLE_ENTRYPOINT,  # keeps the sandbox Started; the worker is exec'd into it
+            *IDLE_ENTRYPOINT,
             app=app, image=registry_image(modal, image, options["registry_secret"]),
             gpu=options["gpu"], cpu=target.cpus, timeout=options["timeout"], secrets=secrets,
             volumes={path: modal.Volume.from_name(name) for path, name in options["volumes"].items()},
         )
-        # A Sandbox does not run the image's ENTRYPOINT, so the worker is started
-        # by name; the image puts its environment's python first on PATH. Set
-        # `command` on the target if the image's python is elsewhere.
+        # The worker runs as an exec'd process, started by name: the image puts its
+        # environment's python first on PATH. Set `command` on the target if the image's
+        # python is elsewhere.
         command = list(target.command) if target.command != ("serve",) else ["python", "-m", "evedesign.remote.worker"]
         self._proc = self._sandbox.exec(*command, text=False)
         self._chunks = iter(self._proc.stdout)

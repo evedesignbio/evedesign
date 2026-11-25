@@ -92,6 +92,7 @@ class GibbsSampler(Generator):
         require_strict_pos : bool = True,
         record_full_chain : bool = True,
         rng: np.random.Generator | None = None,
+        seed: int | None = None,
     ):
         """
         Create new Gibbs sampler
@@ -127,8 +128,14 @@ class GibbsSampler(Generator):
             If False, only final samples at end of each chain will be returned.
         rng
             Numpy random number generator for random sampling. If None, will create own generator inside
-            the sampler.
+            the sampler (seeded with seed).
+        seed
+            Seed for the sampler's own generator, for reproducible runs where no generator can be passed
+            (e.g. from a pipeline spec, or a sampler constructed in another process). Mutually exclusive
+            with rng.
         """
+        if rng is not None and seed is not None:
+            raise ValueError("Specify either rng or seed, not both")
         # must have at least one scorer
         if len(scorers) == 0:
             raise ValueError("Must provide at least one scorer")
@@ -209,7 +216,7 @@ class GibbsSampler(Generator):
                 )
 
         self.record_full_chain = record_full_chain
-        self.rng = np.random.default_rng() if rng is None else rng
+        self.rng = np.random.default_rng(seed) if rng is None else rng
 
     @property
     def system(self) -> System | None:
