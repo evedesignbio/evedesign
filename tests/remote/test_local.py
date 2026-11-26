@@ -238,11 +238,11 @@ hyper_parameters: {lower_bound: 2000, upper_bound: 2600}
 
 
 def test_the_card_applies_to_its_key_only(local, tmp_path, monkeypatch):
-    from evedesign.remote import worker
+    from evedesign.remote import build
 
     card = tmp_path / "README.md"
     card.write_text(CARD)
-    monkeypatch.setattr(worker, "CARD_PATH", card)
+    monkeypatch.setattr(build, "CARD_PATH", card)
 
     def opened(model):
         with open_model(local, model) as m:
@@ -264,6 +264,10 @@ def test_the_card_applies_to_its_key_only(local, tmp_path, monkeypatch):
 
     card.write_text(CARD.replace("key: mw\n", ""))
     assert opened("Molecular weight")["via"] == "model_card"                  # without a key: the name
+
+    # a card may write its class path dotted, as proteingym-models cards allow
+    card.write_text(CARD.replace("physicochemical:Molecular", "physicochemical.Molecular"))
+    assert opened(None)["class"] == "evedesign.restraints.physicochemical.MolecularWeightRestraint"
 
 
 def test_sessions_seed_models_and_refuse_foreign_proxies(local):
@@ -716,6 +720,11 @@ def test_datasets_cross_the_wire(system):
     assert sorted(out.serialize()["splits"]) == ["cv0", "cv1", "cv2"]        # expanded, as plain lists
     assert out.select("y")[2] == data.select("y")[2]
 
+    serialized = data.serialize()
+    assert serialized["schema_version"] == "0.1"
+    with pytest.raises(ValueError, match="Unable to handle LabeledInstanceDataset version 9.9"):
+        LabeledInstanceDataset.deserialize({**serialized, "schema_version": "9.9"})
+
 
 def test_workers_run_without_evedesign_server(system):
     import sys
@@ -727,3 +736,59 @@ def test_workers_run_without_evedesign_server(system):
     spec = {"class": GIBBS, "args": {"num_sweeps": 1, "seed": 1}, "models": {"scorers": [PI, MW]}}
     with open_built(target, spec, system) as sampler:
         assert len(sampler.generate(num_designs=2)) == 2
+
+
+def test_build_local_uses_prebuilt_children(local, system):
+    """A tree built here, with one nested model opened on a target: the sampler runs locally"""
+    from evedesign.remote import build_local
+    from evedesign.samplers.gibbs import GibbsSampler
+
+    mw, pi = dict(MW), dict(PI)
+    gibbs = {"class": "evedesign.samplers.gibbs:GibbsSampler", "args": {"num_sweeps": 2, "seed": 1},
+             "models": {"scorers": [mw, pi]}}
+    with open_built(local, mw, system) as remote_mw:
+        sampler, collection, records = build_local(gibbs, system, prebuilt={id(mw): remote_mw})
+        assert isinstance(sampler, GibbsSampler)
+        assert sampler.scorers[0] is remote_mw and not hasattr(sampler.scorers[1], "_transport")
+        assert [r["via"] for r in records] == ["prebuilt", "class", "class"]
+        assert [obj for _, obj in collection][-1] is sampler
+        assert len(sampler.generate(num_designs=2)) == 2
+
+    # without prebuilt nodes: the whole tree here, as a worker would build it
+    sampler, _, records = build_local(gibbs, system)
+    assert [r["via"] for r in records] == ["class", "class", "class"] and sampler.scorers[0].ready
+
+
+def test_build_local_prebuilt_records_and_checks(local, system):
+    import json
+
+    from evedesign.remote import build_local
+
+    mw = dict(MW)
+    gibbs = {"class": GIBBS, "args": {"num_sweeps": 1, "seed": 1}, "models": {"scorers": [mw, dict(PI)]}}
+    other = system.__class__([type(system[0])(rep="MKTAYIAKQRQISFVKSHFSRQAA", id="A")])
+    with open_built(local, mw, system) as remote_mw:
+        # the record describes the remote model, as its worker reported it
+        _, _, records = build_local(gibbs, system, prebuilt={id(mw): remote_mw})
+        assert records[0]["class"] == MW["class"] and records[0]["citations"] == remote_mw.citations
+        assert records[0]["loaded"] and not records[0]["rebuilt"]
+
+        # a copy of the tree would miss the entry and build the model here: refused before building
+        with pytest.raises(ValueError, match="1 prebuilt entry is not a spec this tree builds"):
+            build_local(json.loads(json.dumps(gibbs)), system, prebuilt={id(mw): remote_mw})
+        # nor is a node inside another prebuilt one (the outer one is used as given)
+        with pytest.raises(ValueError, match="1 prebuilt entry"):
+            build_local(gibbs, system, prebuilt={id(gibbs): object(), id(mw): remote_mw})
+
+    with open_built(local, mw, other) as wrong:
+        with pytest.raises(ValueError, match="built for a different system"):
+            build_local(gibbs, system, prebuilt={id(mw): wrong})
+
+
+def test_records_follow_a_build(local, system):
+    """A model opened unbuilt reports its citations and stats once built, as open_built does"""
+    with open_model(local, MW) as m:
+        assert m.provenance["models"][0]["stats"] is None
+        m.build(system)
+        record = m.provenance["models"][0]
+        assert record["citations"] == MolecularWeightRestraint.citations and "stats" in record

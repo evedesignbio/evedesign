@@ -7,6 +7,7 @@ proxy that behaves like the model.
     open_built(target, model, system, data)    created and built there, nested models included
     reload_model(target, blob)                 a stored model, loaded there
     session(infra, seed)                       owns models, starts and builds them in parallel
+    build_local(spec, system, prebuilt=...)    a tree built here; given nodes (e.g. proxies) used as they are
 
     with session("infra.toml", seed=1234) as s:
         esm, mw = s.open_all([("esm2-gpu", {"key": "esm2", "args": {"device": "cuda"}}),
@@ -24,12 +25,13 @@ from typing import TYPE_CHECKING, Any
 
 _EXPORTS = {
     "Session": "api", "open_model": "api", "open_built": "api", "reload_model": "api", "session": "api",
-    "Infra": "config",
+    "Infra": "config", "build_local": "build",
 }
-__all__ = ["Infra", "Session", "open_built", "open_model", "reload_model", "session"]
+__all__ = ["Infra", "Session", "build_local", "open_built", "open_model", "reload_model", "session"]
 
 if TYPE_CHECKING:
     from .api import Session, open_built, open_model, reload_model, session
+    from .build import build_local
     from .config import Infra
 
 

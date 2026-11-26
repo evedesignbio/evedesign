@@ -21,77 +21,12 @@ import os
 import random
 import sys
 import traceback
-from importlib import import_module
-from pathlib import Path
 from typing import Any
 
 from . import protocol
+from .build import instantiate_tree, printable, resolve
 from .spec import children, validate
 from .surface import PROTOCOL_VERSION, all_attribute_names, declared_surface, interfaces_of, surface_hash
-
-CARD_PATH = Path("/opt/program/README.md")  # proteingym-models layout
-
-
-# ---------------------------------------------------------------------------
-# spec resolution
-# ---------------------------------------------------------------------------
-
-def read_card() -> tuple[dict, str] | None:
-    """(front matter, sha256 of the card file) for the image's model card, if any."""
-    import hashlib
-
-    import yaml
-
-    if not CARD_PATH.is_file():
-        return None
-    text = CARD_PATH.read_text()
-    if not text.startswith("---"):
-        return None
-    return yaml.safe_load(text.split("---", 2)[1]) or {}, hashlib.sha256(text.encode()).hexdigest()
-
-
-def _import(path: str) -> type:
-    """"package.module:Class", or "package.module.Class" as model cards may also write it."""
-    module, _, name = path.partition(":") if ":" in path else path.rpartition(".")
-    return getattr(import_module(module), name)
-
-
-def card_describes(meta: dict, spec: dict) -> bool:
-    """Whether the card is for the model a spec without a class path names: no key, or the
-    card's key (else its name), exactly."""
-    held = meta.get("key", meta.get("name"))
-    return "model_class" in meta and spec.get("key", held) == held
-
-
-def resolve(spec: dict) -> tuple[type, dict, dict]:
-    """
-    (class, constructor args without nested models, record for provenance).
-    The card's hyper_parameters are the defaults when it describes the model (never
-    for a class path); the spec's args override them. Then the spec's wrap factories are applied.
-    """
-    args = dict(spec.get("args") or {})
-    card = None if "class" in spec else read_card()
-    if "class" in spec:
-        cls, record = _import(spec["class"]), {"via": "class", "class": spec["class"]}
-    elif card is not None and card_describes(card[0], spec):
-        meta, card_hash = card
-        cls, record = _import(meta["model_class"]), {
-            "via": "model_card", "class": meta["model_class"], "card_sha256": card_hash}
-        args = {**(meta.get("hyper_parameters") or {}), **args}
-    else:
-        name = spec.get("key")
-        held = card[0].get("key", card[0].get("name")) if card else None
-        raise LookupError(
-            f"cannot resolve model {name!r}: "
-            + (f"the image's model card is for {held!r}" if card else "the image has no model card")
-            + "; name the model by its class path, or by the card's key"
-        )
-    if spec.get("wrap"):
-        from .wrapping import apply_wraps, normalize
-
-        cls, record = apply_wraps(cls, spec["wrap"]), {**record, "wrap": normalize(spec["wrap"])}
-    return cls, args, record
-
 
 def seed_everything(seed: int | None) -> None:
     if seed is None:
@@ -106,49 +41,6 @@ def seed_everything(seed: int | None) -> None:
         import torch
 
         torch.manual_seed(seed)
-
-
-def instantiate_tree(spec: dict, system, data: Any, collection: list, records: list) -> Any:
-    """
-    Create (or load) and build the model spec names, its nested models first.
-    `collection` gets (spec, object) and `records` one record per model, both in
-    build order: children first, in `models` order, the parent last.
-    """
-    from evedesign.model import BaseModel
-
-    build_args = spec.get("build_args") or {}
-    if "serialized" in spec:
-        import dill
-
-        obj = dill.loads(spec["serialized"])
-        if spec.get("rebuild"):
-            obj.build(system=system, data=data, **build_args)
-        elif system is not None and isinstance(obj, BaseModel) and obj.system != system:
-            raise ValueError("the system of the loaded model does not agree with the given system")
-        record = {"via": "serialized", "class": f"{type(obj).__module__}:{type(obj).__qualname__}",
-                  "loaded": True, "rebuilt": bool(spec.get("rebuild"))}
-    else:
-        cls, args, record = resolve(spec)
-        printable = _printable(args)
-        for name, value in (spec.get("models") or {}).items():
-            if isinstance(value, list):
-                args[name] = [instantiate_tree(v, system, v.get("data"), collection, records) for v in value]
-            else:
-                args[name] = instantiate_tree(value, system, value.get("data"), collection, records)
-        obj = cls(**args)
-        if isinstance(obj, BaseModel):
-            obj.build(system=system, data=data, **build_args)
-        record = {**record, "args": printable, "loaded": False, "rebuilt": False}
-
-    record["citations"] = getattr(obj, "citations", None)
-    record["stats"] = obj.stats() if isinstance(obj, BaseModel) and obj.ready else None
-    collection.append((spec, obj))
-    records.append(record)
-    return obj
-
-
-def _printable(args: dict) -> dict:
-    return {k: (v if isinstance(v, (str, int, float, bool, type(None))) else type(v).__name__) for k, v in args.items()}
 
 
 # ---------------------------------------------------------------------------
@@ -194,7 +86,8 @@ class Session:
         cls, args, record = resolve(spec)
         self._devices(devices, _uses_gpu(cls))
         self.instance = cls(**args)
-        self.records = [{**record, "args": _printable(args), "loaded": False, "rebuilt": False}]
+        self.records = [{**record, "args": printable(args), "loaded": False, "rebuilt": False,
+                         "citations": getattr(self.instance, "citations", None), "stats": None}]
         self.collection = [(spec, self.instance)]
         return self.describe()
 
@@ -210,6 +103,8 @@ class Session:
 
     def op_build(self, system, data: Any = None, build_args: dict | None = None) -> dict:
         self.instance.build(system=system, data=data, **(build_args or {}))
+        # the model's record follows its build, as for a tree built by open_built
+        self.records[-1].update(citations=getattr(self.instance, "citations", None), stats=self.instance.stats())
         return self.describe()
 
     def op_call(self, method: str, kwargs: dict) -> Any:
