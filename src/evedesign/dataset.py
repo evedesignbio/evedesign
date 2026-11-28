@@ -5,6 +5,9 @@ from sklearn.model_selection import KFold
 from evedesign.system import SystemInstance
 from evedesign.types import DatasetSplit, DatasetSplitMap
 
+# versioning scheme for serialized LabeledInstanceDataset
+CURRENT_DATASET_SPEC_VERSION = "0.1"
+
 
 class LabeledInstanceDataset:
     """
@@ -129,6 +132,46 @@ class LabeledInstanceDataset:
         self.labels = labels
         self._splits = splits
         self.final_train_val_split = final_train_val_split
+
+    def serialize(self) -> dict:
+        """
+        The dataset as plain data (lists, dicts, numbers, strings), e.g. to send it to
+        another process. Cross-validation splits are stored as their expanded indices.
+        """
+        def indices(split):
+            return {subset: [int(i) for i in idx] for subset, idx in split.items()}
+
+        return {
+            "instances": [inst.serialize() for inst in self.instances],
+            "labels": {
+                name: [None if v is None else float(v) for v in series]
+                for name, series in self.labels.items()
+            },
+            "splits": None if self._splits is None else {
+                name: indices(split) for name, split in self._splits.items()
+            },
+            "final_train_val_split": (
+                None if self.final_train_val_split is None else indices(self.final_train_val_split)
+            ),
+            "schema_version": CURRENT_DATASET_SPEC_VERSION,
+        }
+
+    @classmethod
+    def deserialize(cls, data: dict) -> "LabeledInstanceDataset":
+        """A dataset from serialize() output; validated again by the constructor."""
+        # if not specified, assume first version
+        version = data.get("schema_version", "0.1")
+        if version != CURRENT_DATASET_SPEC_VERSION:
+            raise ValueError(
+                f"Unable to handle LabeledInstanceDataset version {version}"
+            )
+
+        return cls(
+            instances=[SystemInstance.deserialize(inst) for inst in data["instances"]],
+            labels=dict(data["labels"]),
+            splits=data.get("splits"),
+            final_train_val_split=data.get("final_train_val_split"),
+        )
 
     @property
     def names(self) -> list[str]:

@@ -1,0 +1,36 @@
+# Site infrastructure: which targets exist and how to start them.
+# Shared across runs; a run only says which model goes where (placement.toml).
+# Each target lists its own settings; target names contain no colon
+# ("docker:<image>" is a shortcut that needs no entry here).
+
+# local docker, one GPU per model (gpus = "auto", the default)
+[targets.esm2]
+image = "ghcr.io/proteingym/esm2:2026.11"
+
+# pinned to a device, with a CPU limit
+[targets.eve]
+image = "ghcr.io/proteingym/eve:2026.11"
+gpus = [1]
+cpus = 8
+
+# HPC: same image converted to a .sif
+[targets.esmc]
+launcher = "apptainer"
+image = "/srv/sif/esmc.sif"
+
+# Modal: per-model GPU type; private registry and HF token as Modal secrets
+[targets.esm2-modal]
+launcher = "modal"
+image = "ghcr.io/<org>/esm2:2026.11"
+gpu_type = "L40S"
+registry_secret = "ghcr-pull"
+secrets = ["huggingface"]
+volumes = { "/models" = "esm2-weights" }   # weights in a Modal volume, outside the image
+start_timeout = 900
+
+# a whole placed tree (sampler + scorers) in one Modal container
+[targets.modal-full]
+launcher = "modal"
+image = "ghcr.io/<org>/evedesign-full:2026.11"
+gpu_type = "H100"
+timeout = 7200

@@ -11,6 +11,7 @@ from loguru import logger
 from evedesign.constants import GAP
 from evedesign.model import Generator, ConditionalMutationScorer, Scorer
 from evedesign.system import System, Entity, SystemInstance, EntityInstance, BiopolymerEntity
+from evedesign.utils import score_all
 from evedesign.types import StatusCallback, CHAIN_COMPONENT_KEY, SCORE_COMPONENT_KEY, EntityPosList
 from evedesign.utils import status_progress, ensure_sequence, map_array
 
@@ -91,6 +92,7 @@ class GibbsSampler(Generator):
         require_strict_pos : bool = True,
         record_full_chain : bool = True,
         rng: np.random.Generator | None = None,
+        seed: int | None = None,
     ):
         """
         Create new Gibbs sampler
@@ -126,8 +128,14 @@ class GibbsSampler(Generator):
             If False, only final samples at end of each chain will be returned.
         rng
             Numpy random number generator for random sampling. If None, will create own generator inside
-            the sampler.
+            the sampler (seeded with seed).
+        seed
+            Seed for the sampler's own generator, for reproducible runs where no generator can be passed
+            (e.g. from a pipeline spec, or a sampler constructed in another process). Mutually exclusive
+            with rng.
         """
+        if rng is not None and seed is not None:
+            raise ValueError("Specify either rng or seed, not both")
         # must have at least one scorer
         if len(scorers) == 0:
             raise ValueError("Must provide at least one scorer")
@@ -208,7 +216,7 @@ class GibbsSampler(Generator):
                 )
 
         self.record_full_chain = record_full_chain
-        self.rng = np.random.default_rng() if rng is None else rng
+        self.rng = np.random.default_rng(seed) if rng is None else rng
 
     @property
     def system(self) -> System | None:
@@ -664,17 +672,17 @@ class GibbsSampler(Generator):
                 step_pos = order[_POS][:, step]
                 assert len(step_ent) == len(step_pos) == num_designs
 
-                # apply all scorers to current instances and compute weighted sum of scores;
-                # we could decouple GPU and CPU-based computations here with multiprocessing
-                # eventually to increase speed
+                # apply all scorers to current instances (concurrently, so scorers in other
+                # processes cost the slowest rather than the sum) and compute weighted sum
                 agg_scores = None
-                for scorer_idx, (scorer, weight) in enumerate(
-                    zip(self.scorers, self.weights)
+                raw_scores = score_all(
+                    self.scorers, "score_conditional", instances, step_ent, step_pos
+                )
+                for scorer_idx, (raw, weight) in enumerate(
+                    zip(raw_scores, self.weights)
                 ):
                     # compute weighted score
-                    s = scorer.score_conditional(
-                        instances, step_ent, step_pos
-                    ) * weight
+                    s = raw * weight
 
                     s = self._verify_and_update_scores(
                         s, scorer_idx=scorer_idx, alphabet=alphabet, num_designs=num_designs,

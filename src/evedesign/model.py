@@ -1414,4 +1414,9 @@ def system_subset_model(model_class: type[M]) -> type[M]:
         if not hasattr(model_class, attr) and not attr.startswith("_"):
             delattr(SubsetModel, attr)
 
+
+    # the wrapped class, by the usual __wrapped__ convention, so class-level questions
+    # (e.g. requires_gpu, which SubsetModel answers through instance properties) can be
+    # answered without constructing it
+    SubsetModel.__wrapped__ = model_class
     return SubsetModel
