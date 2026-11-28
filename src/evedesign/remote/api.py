@@ -11,7 +11,7 @@ A model is named by a string (a key or a class path), a spec dictionary, or noth
 `<launcher>:<image>` shortcut, or a dictionary; see config.py.
 """
 
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import FIRST_EXCEPTION, ThreadPoolExecutor, wait
 from contextlib import ExitStack
 from pathlib import Path
 from typing import Any, Mapping, Self
@@ -36,8 +36,9 @@ def _open(target: TargetLike, op: str, kwargs: dict, seed: int | None, infra: In
     try:
         hello = transport.request(
             "hello", protocol_version=PROTOCOL_VERSION, surface=surface_hash(), seed=seed, launcher=launcher,
-            timeout=target.start_timeout,
+            lease=target.lease or None, timeout=target.start_timeout,
         )
+        transport.keep_alive(target.lease)
         devices = offer_devices(target)
         descriptor = transport.request(op, **kwargs, devices=devices.as_message())
         settle_devices(devices, descriptor["cuda_visible_devices"])
@@ -45,7 +46,9 @@ def _open(target: TargetLike, op: str, kwargs: dict, seed: int | None, infra: In
     except BaseException:
         transport.close()
         raise
-    record = {"launcher": launcher, "environment": hello["environment"], "spec": _recordable(kwargs["spec"])}
+    # CUDA facts come with the model, collected after the worker chose its devices
+    environment = {**hello["environment"], **descriptor.get("environment", {})}
+    record = {"launcher": launcher, "environment": environment, "spec": _recordable(kwargs["spec"])}
     return make_proxy(transport, descriptor, f"{describe(kwargs['spec'])}@{target.name}", record)
 
 
@@ -175,30 +178,43 @@ class Session:
                 raise ValueError(f"open_all: unknown options {sorted(set(options) - {'seed'})}; only 'seed'")
             spec = as_spec(model)  # every spec is checked before any worker starts
             entries.append((target, spec, self._seed(spec, options.get("seed"))))
-        with ThreadPoolExecutor(max_workers=max(1, len(entries))) as pool:
-            futures = [pool.submit(open_model, t, spec, seed=seed, infra=self.infra) for t, spec, seed in entries]
-        opened, failed = [], None
-        for i, future in enumerate(futures):
-            try:
-                opened.append(future.result())
-            except BaseException as exc:  # noqa: BLE001 -- reported below, after cleanup
-                failed = failed or (i, exc)
-        if failed is not None:
-            for proxy in opened:
-                proxy.close()
-            i, exc = failed
-            target, spec, _ = entries[i]
-            exc.add_note(f"open_all: entry {i} ({describe(spec)} on {target!r}) failed to start; "
-                         f"the other models were closed")
-            raise exc
-        return [self._keep(proxy) for proxy in opened]
+        pool = ThreadPoolExecutor(max_workers=max(1, len(entries)))
+        futures = [pool.submit(open_model, t, spec, seed=seed, infra=self.infra) for t, spec, seed in entries]
+        try:
+            wait(futures, return_when=FIRST_EXCEPTION)
+            failed = next(((i, f.exception()) for i, f in enumerate(futures) if f.done() and f.exception()), None)
+            if failed is not None:
+                i, exc = failed
+                target, spec, _ = entries[i]
+                exc.add_note(f"open_all: entry {i} ({describe(spec)} on {target!r}) failed to start; "
+                             f"the other models were closed")
+                raise exc
+        except BaseException:
+            # failed or interrupted: close what opened, and what still opens, without waiting for it
+            for future in futures:
+                future.add_done_callback(_close_opened)
+            raise
+        finally:
+            pool.shutdown(wait=False, cancel_futures=True)
+        return [self._keep(future.result()) for future in futures]
 
     def build_all(self, system, data: Any = None) -> None:
-        """Build every unbuilt model concurrently; isolated builds are independent."""
+        """Build every unbuilt model concurrently; isolated builds are independent. If one fails
+        (or this is interrupted), the builds still running are stopped, not waited for."""
         pending = [m for m in self.models if not m.ready]
-        with ThreadPoolExecutor(max_workers=max(1, len(pending))) as pool:
-            for future in [pool.submit(m.build, system, data) for m in pending]:
+        pool = ThreadPoolExecutor(max_workers=max(1, len(pending)))
+        futures = {pool.submit(m.build, system, data): m for m in pending}
+        try:
+            done, _ = wait(futures, return_when=FIRST_EXCEPTION)
+            for future in done:
                 future.result()
+        except BaseException:
+            for future, model in futures.items():
+                if not future.done():
+                    model.close()  # stops its worker; that build ends with SessionLost
+            raise
+        finally:
+            pool.shutdown(wait=False)
 
     def provenance(self) -> list[dict]:
         return [m.provenance for m in self.models]
@@ -208,6 +224,11 @@ class Session:
 
     def __exit__(self, *exc: object) -> None:
         self._stack.close()
+
+
+def _close_opened(future) -> None:
+    if not future.cancelled() and future.exception() is None:
+        future.result().close()
 
 
 def session(infra: InfraLike = None, seed: int | None = None) -> Session:

@@ -30,7 +30,8 @@ def _version(dist: str) -> str | None:
 
 
 def collect_environment(seed: int | None = None) -> dict[str, Any]:
-    """Run inside the worker (and locally for in-process models)."""
+    """Run inside the worker (and locally for in-process models). Asks torch nothing about CUDA
+    (see collect_cuda)."""
     packages = sorted(
         f"{d.metadata['Name']}=={d.version}" for d in metadata.distributions() if d.metadata["Name"]
     )
@@ -46,14 +47,6 @@ def collect_environment(seed: int | None = None) -> dict[str, Any]:
     }
     if "torch" in sys.modules or _version("torch"):
         env["torch"] = _version("torch")
-        try:
-            import torch
-
-            env["cuda"] = torch.version.cuda
-            env["cudnn"] = torch.backends.cudnn.version() if torch.backends.cudnn.is_available() else None
-            env["cuda_available"] = torch.cuda.is_available()
-        except Exception:  # noqa: BLE001 -- provenance must never break a session
-            pass
     if shutil.which("nvidia-smi"):
         out = subprocess.run(
             ["nvidia-smi", "--query-gpu=name,driver_version", "--format=csv,noheader"],
@@ -61,6 +54,21 @@ def collect_environment(seed: int | None = None) -> dict[str, Any]:
         )
         env["gpus"] = [line.strip() for line in out.stdout.splitlines() if line.strip()]
     return env
+
+
+def collect_cuda() -> dict[str, Any]:
+    """torch's CUDA facts. Asking torch initialises CUDA, which then ignores later changes to
+    CUDA_VISIBLE_DEVICES: the worker calls this only after choosing its devices."""
+    if "torch" not in sys.modules and not _version("torch"):
+        return {}
+    try:
+        import torch
+
+        return {"cuda": torch.version.cuda,
+                "cudnn": torch.backends.cudnn.version() if torch.backends.cudnn.is_available() else None,
+                "cuda_available": torch.cuda.is_available()}
+    except Exception:  # noqa: BLE001 -- provenance must never break a session
+        return {}
 
 
 # ---------------------------------------------------------------------------

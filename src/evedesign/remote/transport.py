@@ -12,8 +12,11 @@ import os
 import shutil
 import subprocess
 import threading
+import time
 from dataclasses import dataclass
 from typing import Any
+
+from loguru import logger
 
 from . import protocol
 from .config import Target
@@ -39,10 +42,10 @@ class Transport:
     def _receive(self) -> dict[str, Any]: ...
     def _terminate(self, kill: bool = False) -> None: ...
 
-    def _receive_within(self, timeout: float | None, op: str) -> dict[str, Any]:
-        """_receive, giving up after `timeout` seconds: the worker is then stopped, since a
+    def _receive_within(self, deadline: float | None, op: str, timeout: float | None) -> dict[str, Any]:
+        """_receive, giving up at `deadline` (time.monotonic()): the worker is then stopped, since a
         stream cannot be resynchronised mid-frame."""
-        if timeout is None:
+        if deadline is None:
             return self._receive()
         outcome: dict[str, Any] = {}
 
@@ -54,7 +57,7 @@ class Transport:
 
         reader = threading.Thread(target=receive, daemon=True)
         reader.start()
-        reader.join(timeout)
+        reader.join(max(0.0, deadline - time.monotonic()))
         if reader.is_alive():
             self._closed = True
             self._terminate(kill=True)
@@ -63,7 +66,36 @@ class Transport:
             raise outcome["error"]
         return outcome["reply"]
 
-    def request(self, op: str, /, *, timeout: Any = _DEFAULT, **kwargs: Any) -> Any:
+    def _exchange(self, op: str, timeout: float | None, kwargs: dict, status_callback=None) -> Any:
+        """One call and its reply; the caller holds the lock. Status messages the worker sends
+        while the call runs go to status_callback."""
+        msg_id = next(self._ids)
+        message = {"id": msg_id, "type": "call", "method": op, "kwargs": kwargs}
+        if status_callback is not None:
+            message["status"] = True
+        # encoded first: a call too large to send fails here and leaves the session usable
+        data = protocol.encode(message)
+        label = kwargs.get("method", op)
+        deadline = None if timeout is None else time.monotonic() + timeout
+        try:
+            self._send(data)
+            reply = self._receive_within(deadline, label, timeout)
+            while reply.get("type") == "status":
+                if reply.get("id") == msg_id:
+                    _report(status_callback, reply, self.description)
+                reply = self._receive_within(deadline, label, timeout)
+        except TimeoutError:
+            raise
+        except (EOFError, BrokenPipeError, OSError) as exc:
+            self._closed = True
+            raise protocol.SessionLost(f"{self.description}: worker went away ({exc})") from exc
+        if reply.get("id") != msg_id:
+            raise protocol.SessionLost(f"{self.description}: out-of-order reply {reply.get('id')} != {msg_id}")
+        if reply["type"] == "error":
+            raise protocol.RemoteError(reply["error_type"], reply["message"], reply.get("traceback", ""))
+        return reply["value"]
+
+    def request(self, op: str, /, *, timeout: Any = _DEFAULT, status_callback=None, **kwargs: Any) -> Any:
         """Send one call and wait for its reply, for at most `timeout` seconds
         (default: call_timeout)."""
         if self._closed:
@@ -71,34 +103,49 @@ class Transport:
         if timeout is _DEFAULT:
             timeout = self.call_timeout
         with self._lock:
-            msg_id = next(self._ids)
-            # encoded first: a call too large to send fails here and leaves the session usable
-            data = protocol.encode({"id": msg_id, "type": "call", "method": op, "kwargs": kwargs})
-            label = kwargs.get("method", op)
+            return self._exchange(op, timeout, kwargs, status_callback)
+
+    def keep_alive(self, lease: float | None) -> None:
+        """Ping the worker every lease/3 seconds while no call runs, so its lease does not run out."""
+        if lease:
+            threading.Thread(target=self._ping, args=(lease / 3,), daemon=True).start()
+
+    def _ping(self, every: float) -> None:
+        while not self._closed:
+            time.sleep(every)
+            if not self._lock.acquire(blocking=False):
+                continue  # a call is running: the worker knows it is in use
             try:
-                self._send(data)
-                reply = self._receive_within(timeout, label)
-            except TimeoutError:
-                raise
-            except (EOFError, BrokenPipeError, OSError) as exc:
-                self._closed = True
-                raise protocol.SessionLost(f"{self.description}: worker went away ({exc})") from exc
-        if reply.get("id") != msg_id:
-            raise protocol.SessionLost(f"{self.description}: out-of-order reply {reply.get('id')} != {msg_id}")
-        if reply["type"] == "error":
-            raise protocol.RemoteError(reply["error_type"], reply["message"], reply.get("traceback", ""))
-        return reply["value"]
+                self._exchange("ping", 30, {})
+            except Exception:  # noqa: BLE001 -- a lost worker shows on the next call
+                pass
+            finally:
+                self._lock.release()
 
     def close(self) -> None:
-        """Idempotent; cleanup paths call it more than once."""
+        """Idempotent; cleanup paths call it more than once. Never waits for a call running in
+        another thread: that worker is stopped, and the call ends with SessionLost."""
         if self._closed:
             return
+        if not self._lock.acquire(blocking=False):
+            self._closed = True
+            self._terminate(kill=True)
+            return
         try:
-            self.request("close", timeout=30 if self.call_timeout is None else min(30, self.call_timeout))
+            self._exchange("close", 30 if self.call_timeout is None else min(30, self.call_timeout), {})
         except Exception:  # noqa: BLE001 -- closing a dead worker is fine
             pass
+        finally:
+            self._lock.release()
         self._closed = True
         self._terminate()
+
+
+def _report(status_callback, message: dict, description: str) -> None:
+    try:
+        status_callback(message["status"], message.get("progress"), message.get("message"))
+    except Exception as exc:  # noqa: BLE001 -- the stream must still be read to the reply
+        logger.warning(f"{description}: status_callback raised {exc!r}")
 
 
 class StdioTransport(Transport):

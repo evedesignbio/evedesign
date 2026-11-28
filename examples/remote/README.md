@@ -257,13 +257,14 @@ Which model of a pipeline runs where (placement) is part of evedesign-server
 | `mounts` | — | folders to make visible: `["/data/weights:/models:ro"]` (docker, podman, apptainer) |
 | `start_timeout` | none | seconds to wait for the worker to start; then it is stopped and you get a `TimeoutError` |
 | `call_timeout` | none | seconds one call may take; then the worker is stopped and the model can't be used any more |
+| `lease` | `300` | seconds an idle worker waits for a message before it takes the orchestrator to be gone and exits (on Modal, with its Sandbox); the orchestrator pings meanwhile. `0` turns it off |
 
 Launcher-specific settings:
 
 | Launcher | Settings |
 |---|---|
 | docker, podman | `shm_size` (default `"2g"`), `network_mode` (e.g. `"none"`) |
-| modal | `gpu_type` (e.g. `"H100"`, `"H100:2"`), `timeout` (default 24 hours), `app` (default `"evedesign-remote"`), `registry_secret`, `secrets`, `volumes` |
+| modal | `gpu_type` (e.g. `"H100"`, `"H100:2"`), `memory` (MiB reserved, or `[request, limit]`), `allow_tags` (default `false`: images by digest), `timeout` (default 24 hours), `app` (default `"evedesign-remote"`), `registry_secret`, `secrets`, `volumes` |
 | command | `network = true` when the command reaches another machine (ssh, srun, kubectl) |
 
 Every launcher starts the worker the same way, as `python -m evedesign.remote.worker`
@@ -377,11 +378,15 @@ Each session is a Modal Sandbox from the target's registry image, kept for the w
 session. There is nothing to deploy. The image's ENTRYPOINT is reset and the Sandbox's
 main process is `sleep infinity`, so any image works whatever its entrypoint; the worker
 runs next to it, and the Sandbox ends when the session closes or `timeout` is reached.
+A worker on Modal gets no EOF when its orchestrator dies, so it relies on its `lease`: once
+no ping has arrived for that long, it ends itself and its Sandbox.
 The reset is an image layer Modal builds once per image.
 
 1. `pip install "evedesign[modal]"`, then run `modal token new` (or set `MODAL_TOKEN_ID` /
    `MODAL_TOKEN_SECRET`) where the orchestrator runs.
-2. Push the image to a registry Modal can pull from, and use its digest.
+2. Push the image to a registry Modal can pull from, and use its digest
+   (`docker buildx imagetools inspect <tag>`). Every Sandbox pulls the image again, so a tag
+   could move mid-run; a tag is refused unless the target sets `allow_tags = true`.
 3. For a private registry: `modal secret create ghcr-pull REGISTRY_USERNAME=<user> REGISTRY_PASSWORD=<token>`.
    For AWS ECR (`<account>.dkr.ecr.<region>.amazonaws.com/...`), use the keys of an IAM user
    with read access instead: `modal secret create aws-ecr AWS_ACCESS_KEY_ID=... AWS_SECRET_ACCESS_KEY=... AWS_REGION=...`.
@@ -396,14 +401,16 @@ gpu_type = "L40S"               # or "H100:2" for two; gpus = "none" for no GPU
 registry_secret = "ghcr-pull"   # private images
 secrets = ["huggingface"]       # named Modal secrets, e.g. HF_TOKEN
 volumes = { "/models" = "esm2-weights" }   # optional: weights outside the image
-cpus = 4                        # optional: CPU reservation and thread counts
+cpus = 4                        # optional (default 1): CPU reservation and thread counts
+memory = 16384                  # optional: MiB reserved; [16384, 32768] adds a hard limit
 timeout = 14400                 # upper bound on a session's lifetime (s)
 start_timeout = 900             # optional: give up if the worker has not started
 ```
 
 The worker's logs stream to your stderr. A Sandbox holds its GPU while the session is
 open, so close sessions when done (`with ...`). `start_timeout` covers the worker
-starting, not the creation of the Sandbox.
+starting, not the creation of the Sandbox. With a `memory` limit, a model that exceeds it
+ends the whole Sandbox; the call then fails with `SessionLost`, naming the limit.
 
 ## Venvs, other machines and other providers
 
@@ -498,8 +505,10 @@ transport does.
   against their signatures. Undeclared attributes raise.
 - **Worker:** `python -m evedesign.remote.worker`. It imports `class` (constructor
   defaults), or else uses the image's model card for its key (or no name). Nested models
-  come only from the spec's `models`. It exits on stdin EOF, and needs nothing but
-  evedesign.
+  come only from the spec's `models`. It exits on stdin EOF or when its lease runs out,
+  and needs nothing but evedesign.
+- **Status:** a `status_callback` passed to `build()` or a declared method is called here,
+  as the worker reports status (at most 5 messages a second, plus the last).
 - **Wire:** length-prefixed msgpack. System, SystemInstance and LabeledInstanceDataset
   travel via `serialize()`, DataFrames column by column (numeric as arrays, strings as
   lists; other dtypes are refused), and numpy arrays as raw bytes. There is no pickle, so
@@ -509,7 +518,9 @@ transport does.
   Sandbox), `command` (any argv: venvs, ssh, srun, kubectl; not hermetic), and plugins
   (entry point group `evedesign.remote.launchers`).
 - **Timeouts:** on `start_timeout` or `call_timeout` the worker is stopped (docker
-  containers by name) and `TimeoutError` raised; the session cannot continue.
+  containers by name) and `TimeoutError` raised; the session cannot continue. Closing a
+  model from another thread while a call runs stops its worker at once; that call then
+  raises `SessionLost`.
 - **Provenance:** before launch, the image digest or `.sif` sha256 is pinned. The worker
   reports evedesign, python and package hashes, the model class, resolved arguments,
   the seed, and GPUs. A run's provenance file can be used as a lock.

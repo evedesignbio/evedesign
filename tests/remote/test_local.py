@@ -115,6 +115,35 @@ def test_score_all_preserves_order_and_overlaps_calls():
     assert time.perf_counter() - started < 0.25
 
 
+def test_score_all_has_no_shared_limit():
+    """40 samplers scoring at once, each nesting score_all: no queueing behind a shared pool, no
+    deadlock; and the callers' pools go with them"""
+    import gc
+    import threading
+    import time
+
+    from evedesign.utils import score_all
+
+    class Slow:
+        def f(self, x): time.sleep(0.2); return x
+
+    class Composite:
+        def f(self, x): return sum(score_all([Slow(), Slow()], "f", x))
+
+    results = []
+    before = threading.active_count()
+    started = time.perf_counter()
+    callers = [threading.Thread(target=lambda: results.append(score_all([Composite(), Slow()], "f", 1)))
+               for _ in range(40)]
+    for c in callers:
+        c.start()
+    for c in callers:
+        c.join(10)
+    assert results == [[2, 1]] * 40 and time.perf_counter() - started < 2
+    gc.collect()
+    assert _eventually(lambda: threading.active_count() <= before)
+
+
 # --- proxies ---------------------------------------------------------------------
 
 def test_proxy_behaves_like_the_model(local, system):
@@ -307,7 +336,8 @@ def test_open_all_starts_workers_together_and_cleans_up(local, monkeypatch):
         with pytest.raises(RemoteError) as err:
             s.open_all([(local, MW), (local, "no.such.module:Model")])
         assert "entry 1 (no.such.module:Model" in "".join(err.value.__notes__)
-        assert len(transports) == 2 and transports[0]._closed and len(s.models) == 2   # the good one closed
+        # the good one is closed, once opened: open_all does not wait for it
+        assert len(transports) == 2 and _eventually(lambda: transports[0]._closed) and len(s.models) == 2
     assert threading.active_count() >= 1
 
 
@@ -339,7 +369,7 @@ INFRA = {
                 "start_timeout": 600, "call_timeout": 3600},
         "esmc": {"launcher": "apptainer", "image": "/srv/sif/esmc.sif", "gpus": "none"},
         "esm2-modal": {"launcher": "modal", "image": "ghcr.io/x/esm2@sha256:ab", "gpu_type": "L40S",
-                       "volumes": {"/models": "w"}},
+                       "memory": 16384, "volumes": {"/models": "w"}},
         "venv": {"launcher": "command", "command": ["/opt/venv/bin/python", "-m", "evedesign.remote.worker"]},
     },
 }
@@ -792,3 +822,229 @@ def test_records_follow_a_build(local, system):
         m.build(system)
         record = m.provenance["models"][0]
         assert record["citations"] == MolecularWeightRestraint.citations and "stats" in record
+
+
+# --- lifetime, status, Modal transport ------------------------------------------------
+
+def _eventually(check, seconds=5.0):
+    import time
+
+    end = time.monotonic() + seconds
+    while not check():
+        if time.monotonic() > end:
+            return False
+        time.sleep(0.05)
+    return True
+
+
+# A scorer that takes a while and reports progress; run as the worker's __main__
+SLOW = """
+import time
+from evedesign.restraints.physicochemical import MolecularWeightRestraint
+
+class Slow(MolecularWeightRestraint):
+    def score(self, instances, status_callback=None):
+        for i in range(5):
+            if status_callback is not None:
+                status_callback("running", i / 5, None)
+            time.sleep(0.3)
+        if status_callback is not None:
+            status_callback("done", None, "scored")
+        return super().score(instances)
+
+from evedesign.remote.worker import main; main()
+"""
+SLOW_SPEC = {"class": "__main__:Slow", "args": {"lower_bound": 2000, "upper_bound": 2600}}
+
+
+def _slow_target():
+    import sys
+
+    return {"launcher": "command", "command": [sys.executable, "-c", SLOW], "call_timeout": 60}
+
+
+def test_status_callbacks_cross_the_wire(system):
+    seen = []
+    with open_model(_slow_target(), SLOW_SPEC) as m:
+        m.build(system, status_callback=lambda *a: seen.append(("build", *a)))   # accepted, not required
+        scored = m.score([system.rep_to_instance(True)], status_callback=lambda *a: seen.append(a))
+        assert len(scored) == 1
+        assert [p for s, p, _ in seen if s == "running"] == [0.0, 0.2, 0.4, 0.6, 0.8]
+        assert seen[-1] == ("done", None, "scored")
+        assert len(m.score([system.rep_to_instance(True)])) == 1                  # without: no messages
+
+
+def test_close_does_not_wait_for_a_running_call(system):
+    import threading
+    import time
+
+    from evedesign.remote.protocol import SessionLost
+
+    errors = []
+    with open_model(_slow_target(), SLOW_SPEC) as m:
+        m.build(system)
+
+        def score():
+            try:
+                m.score([system.rep_to_instance(True)])
+            except BaseException as exc:  # noqa: BLE001
+                errors.append(exc)
+
+        caller = threading.Thread(target=score)
+        caller.start()
+        time.sleep(0.3)
+        started = time.monotonic()
+        m.close()                                                    # from another thread, mid-call
+        assert time.monotonic() - started < 1.0                      # the call needs 1.5 s
+        caller.join(5)
+        assert isinstance(errors[0], SessionLost)
+
+
+def _worker(lease: float):
+    import sys
+
+    from evedesign.remote.surface import PROTOCOL_VERSION, surface_hash
+    from evedesign.remote.transport import StdioTransport
+
+    transport = StdioTransport([sys.executable, "-m", "evedesign.remote.worker"], "worker")
+    transport.request("hello", protocol_version=PROTOCOL_VERSION, surface=surface_hash(), lease=lease)
+    return transport
+
+
+def test_a_worker_whose_lease_runs_out_exits(monkeypatch):
+    import sys
+    import time
+
+    from evedesign.remote.transport import StdioTransport
+
+    monkeypatch.delenv("EVEDESIGN_WORKER_END_CONTAINER", raising=False)
+    monkeypatch.setenv("EVEDESIGN_WORKER_LEASE", "1.5")                       # as the Modal launcher sets it
+    unheard = StdioTransport([sys.executable, "-m", "evedesign.remote.worker"], "worker")
+    monkeypatch.delenv("EVEDESIGN_WORKER_LEASE")
+    assert unheard._proc.wait(timeout=10) == 0                      # no hello ever came: gone all the same
+    idle, pinged = _worker(1.5), _worker(1.5)
+    pinged.keep_alive(1.5)
+    try:
+        assert idle._proc.wait(timeout=10) == 0                     # no message for 1.5 s: gone
+        time.sleep(1)
+        assert pinged._proc.poll() is None and pinged.request("ping") is None   # pings keep it
+    finally:
+        idle.close()
+        pinged.close()
+
+
+def test_an_expired_worker_ends_its_container_only_when_asked(monkeypatch):
+    import os
+    import signal
+
+    from evedesign.remote import worker
+
+    killed = []
+    monkeypatch.setattr(os, "kill", lambda pid, sig: killed.append((pid, sig)))
+    monkeypatch.setattr(os, "_exit", lambda code: (_ for _ in ()).throw(SystemExit(code)))
+    monkeypatch.delenv("EVEDESIGN_WORKER_END_CONTAINER", raising=False)
+    with pytest.raises(SystemExit):
+        worker._expire(1)
+    assert killed == []                                              # never PID 1 of a plain host
+    monkeypatch.setenv("EVEDESIGN_WORKER_END_CONTAINER", "1")
+    with pytest.raises(SystemExit):
+        worker._expire(1)
+    assert killed == [(1, signal.SIGTERM)]
+
+
+def test_cuda_facts_are_collected_after_devices_are_chosen(local, monkeypatch):
+    import os
+
+    from evedesign.remote import provenance
+
+    visible = []
+    monkeypatch.setattr(provenance, "collect_cuda",
+                        lambda: visible.append(os.environ.get("CUDA_VISIBLE_DEVICES")) or {"cuda": "12.4"})
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "7")
+    hello = provenance.collect_environment()
+    assert "cuda" not in hello and "cuda_available" not in hello  # the handshake leaves CUDA alone
+    with open_model(local, MW) as m:
+        assert visible == [""] and m.provenance["environment"]["cuda"] == "12.4"   # set first, then asked
+
+
+def test_modal_targets_validate_memory_and_want_digests():
+    from evedesign.remote.provenance import pin
+
+    modal = {"launcher": "modal", "image": "ghcr.io/x/esm2@sha256:ab"}
+    for memory in (16384, [16384, 32768]):
+        Infra().resolve({**modal, "memory": memory})
+    for memory in ([1, 2, 3], "16Gi", True, [32768, 16384], 0):
+        with pytest.raises(ValueError, match="memory is MiB"):
+            Infra().resolve({**modal, "memory": memory})
+    assert pin(Infra().resolve(modal))["pinned_by_digest"]
+    tagged = {**modal, "image": "ghcr.io/x/esm2:1"}
+    with pytest.raises(ValueError, match="pinned by digest"):
+        pin(Infra().resolve(tagged))
+    assert not pin(Infra().resolve({**tagged, "allow_tags": True}))["pinned_by_digest"]
+    for lease in (-1, True, "5"):
+        with pytest.raises(ValueError, match="lease"):
+            Infra().resolve({**modal, "lease": lease})
+
+
+def _modal(monkeypatch, **options):
+    import sys
+
+    from evedesign.remote.modal_launcher import ModalTransport
+
+    from . import fake_modal
+    from .conftest import SRC
+
+    module, calls = fake_modal.make(python=sys.executable, pythonpath=SRC)
+    monkeypatch.setitem(sys.modules, "modal", module)
+    target = Infra().resolve({"launcher": "modal", "image": "i@sha256:ab", **options})
+    return ModalTransport, target, module, calls
+
+
+def test_modal_sandbox_settings_and_cleanup(monkeypatch):
+    ModalTransport, target, module, calls = _modal(monkeypatch, memory=[512, 1024])
+    transport = ModalTransport(target, target.image)
+    kwargs = calls["sandboxes"][0].kwargs
+    transport.close()
+    assert kwargs["memory"] == (512, 1024) and kwargs["cpu"] == 1          # default: one core, not 1/8
+    flags = kwargs["secrets"][-1].value
+    assert flags["EVEDESIGN_WORKER_END_CONTAINER"] == "1" and flags["OMP_NUM_THREADS"] == "1"
+    assert flags["EVEDESIGN_WORKER_LEASE"] == "300"
+
+    def broken_exec(self, *command, text=True):
+        raise RuntimeError("exec failed")
+
+    monkeypatch.setattr(module.Sandbox, "exec", broken_exec)
+    with pytest.raises(RuntimeError, match="exec failed"):
+        ModalTransport(target, target.image)
+    assert calls["sandboxes"][-1].terminated                                 # not left idling
+
+
+def test_modal_sends_in_chunks_and_ends_cleanly_on_modal_errors(monkeypatch):
+    ModalTransport, target, _, calls = _modal(monkeypatch, memory=[512, 1024])
+    transport = ModalTransport(target, target.image)
+    writes = []
+
+    class Stdin:
+        def write(self, data):
+            writes.append(len(data))
+
+        def drain(self):
+            writes.append("drain")
+
+    real = transport._proc.stdin
+    transport._proc.stdin = Stdin()
+    transport._send(b"\0" * (9 << 20))
+    assert writes == [4 << 20, "drain", 4 << 20, "drain", 1 << 20, "drain"]   # Modal refuses big writes
+
+    class Gone:
+        def write(self, data):
+            raise BufferError("Buffer size exceed limit")
+
+    transport._proc.stdin = Gone()
+    from evedesign.remote.protocol import SessionLost
+
+    with pytest.raises(SessionLost, match="memory limit of 1024 MiB"):
+        transport.request("ping")
+    calls["sandboxes"][0].terminate = lambda wait=False: (_ for _ in ()).throw(RuntimeError("not found"))
+    transport._proc.stdin = real
+    transport.close()                                                         # an ended Sandbox: no error

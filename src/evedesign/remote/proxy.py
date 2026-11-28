@@ -82,8 +82,9 @@ class RemoteModel:
         bound = signature.bind(*args, **kwargs)
         bound.apply_defaults()
         arguments = dict(bound.arguments)
-        arguments.pop("status_callback", None)  # not serialisable; nobody watches a worker
-        return self._call("call", method=name, kwargs=arguments)
+        # the callback stays here: the worker sends status messages, the transport calls it
+        callback = arguments.pop("status_callback", None)
+        return self._call("call", method=name, kwargs=arguments, status_callback=callback)
 
     @property
     def system(self):
@@ -99,7 +100,8 @@ class RemoteModel:
         spec = self.provenance.get("spec") or {}
         data = spec.get("data") if data is None else data
         build_args = {**(spec.get("build_args") or {}), **build_args}
-        descriptor = self._call("build", system=system, data=data, build_args=build_args)
+        descriptor = self._call("build", system=system, data=data, build_args=build_args,
+                                status_callback=status_callback)
         self._apply(descriptor, system=system)
         return self
 

@@ -1,4 +1,5 @@
 from contextlib import contextmanager
+import threading
 from concurrent.futures import ThreadPoolExecutor
 from collections import defaultdict
 import os
@@ -140,7 +141,7 @@ def available_cpus() -> int:
     return os.cpu_count() or 1
 
 
-_SCORE_POOL: ThreadPoolExecutor | None = None
+_POOLS = threading.local()
 
 
 def score_all(scorers: Sequence[Any], method: str, *args: Any, **kwargs: Any) -> list[Any]:
@@ -151,11 +152,16 @@ def score_all(scorers: Sequence[Any], method: str, *args: Any, **kwargs: Any) ->
     latencies per step; concurrently it costs the slowest. Threads suffice:
     proxies wait on I/O, and numpy-heavy local scorers release the GIL. Order
     is preserved and the first failure propagates.
+
+    Each calling thread has its own pool, reused from call to call: concurrent
+    samplers do not queue behind each other, and a nested call (made from a
+    pool thread) has a pool of its own, so it cannot deadlock. A pool goes
+    when its thread ends.
     """
-    global _SCORE_POOL
     if len(scorers) <= 1:
         return [getattr(s, method)(*args, **kwargs) for s in scorers]
-    if _SCORE_POOL is None:
-        _SCORE_POOL = ThreadPoolExecutor(max_workers=32, thread_name_prefix="score_all")
-    futures = [_SCORE_POOL.submit(getattr(s, method), *args, **kwargs) for s in scorers]
+    if getattr(_POOLS, "size", 0) < len(scorers):
+        _POOLS.pool = ThreadPoolExecutor(max_workers=len(scorers), thread_name_prefix="score_all")
+        _POOLS.size = len(scorers)
+    futures = [_POOLS.pool.submit(getattr(s, method), *args, **kwargs) for s in scorers]
     return [f.result() for f in futures]

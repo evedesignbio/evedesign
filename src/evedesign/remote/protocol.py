@@ -24,6 +24,11 @@ MAX_FRAME = int(os.environ.get("EVEDESIGN_REMOTE_MAX_FRAME_MB", "2048")) << 20
 READY = b"\x00evedesign.remote:ready\x00"
 _SKIP_LIMIT = 1 << 20
 
+# Set by a launcher whose container ends when its PID 1 does (Modal): a worker whose lease
+# ran out then signals PID 1, so the container does not outlive it.
+END_CONTAINER = "EVEDESIGN_WORKER_END_CONTAINER"
+LEASE = "EVEDESIGN_WORKER_LEASE"
+
 
 class RemoteError(RuntimeError):
     """

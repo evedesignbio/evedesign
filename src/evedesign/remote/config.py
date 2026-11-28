@@ -57,6 +57,9 @@ class Target:
     # On expiry the worker is stopped and TimeoutError raised.
     start_timeout: float | None = None
     call_timeout: float | None = None
+    # seconds an idle worker waits for a message before taking its orchestrator to be gone and
+    # exiting (on Modal, with its Sandbox); the orchestrator pings meanwhile. 0 turns it off.
+    lease: float = 300
     options: Mapping[str, Any] = field(default_factory=dict, hash=False)
     # set when resolved through a lock
     pinned: bool = False
@@ -75,6 +78,8 @@ class Target:
             value = getattr(self, key)
             if value is not None and (isinstance(value, bool) or not isinstance(value, (int, float)) or value <= 0):
                 raise ValueError(f"target {self.name!r}: {key} must be a positive number of seconds")
+        if isinstance(self.lease, bool) or not isinstance(self.lease, (int, float)) or self.lease < 0:
+            raise ValueError(f"target {self.name!r}: lease must be a number of seconds (0 turns it off)")
         launcher = self.launcher_impl
         unknown = set(self.options) - set(launcher.options)
         if unknown:
